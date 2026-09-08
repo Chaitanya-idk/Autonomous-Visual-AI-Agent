@@ -274,8 +274,8 @@ def train(cfg: Dict[str, Any]):
         if max_chunks:
             chunks = chunks[:max_chunks]
 
-        # Estimated steps
-        steps_per_epoch = len(chunks) * (chunk_size * 2500 // batch_size)
+        # Estimated steps (~15,900 rows per full SAGE shard)
+        steps_per_epoch = len(chunks) * (chunk_size * 15900 // batch_size)
     else:
         train_ds, val_ds, label2id = build_datasets(cfg, processor)
         labels_path.parent.mkdir(parents=True, exist_ok=True)
@@ -407,6 +407,11 @@ def train(cfg: Dict[str, Any]):
                         except Exception:
                             pass
                 print(f"[Disk Cleared] Flushed shards {shard_group}. Disk usage stays < 1.3 GB.", flush=True)
+
+                # Intermediate checkpoint so progress is safe even if interrupted
+                latest_ckpt = ckpt_dir / "latest_checkpoint"
+                model.save_pretrained(str(latest_ckpt))
+                print(f"  [Checkpoint] Intermediate weights saved → {latest_ckpt}", flush=True)
 
         else:
             pbar = tqdm(
