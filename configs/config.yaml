@@ -116,7 +116,7 @@ paths:
   labels_json: "data/labels.json"
 
 model:
-  name_or_path: "/kaggle/input/qwen2-5-vl-3b-instruct"  # ← local path on Kaggle
+  name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"  # ← local path on Kaggle
   local_files_only: true    # ← MUST be true when using local path
   torch_dtype: "bfloat16"
 
