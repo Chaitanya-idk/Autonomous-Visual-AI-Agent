@@ -6,18 +6,11 @@
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  # Option A: Kaggle model hub (add the model via Kaggle UI)
-  #   name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"
-  #   local_files_only: true
-  #
-  # Option B: HuggingFace Hub (needs internet ON in Kaggle settings)
-  #   name_or_path: "Qwen/Qwen2.5-VL-3B-Instruct"
-  #   local_files_only: false
   name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"
   local_files_only: true
-  # bfloat16: A100/L4/H100 (best quality)
-  # float16:  T4/P100 (older GPUs, use this if bf16 throws errors)
-  torch_dtype: "bfloat16"
+  # float16: hardware accelerated on T4/P100 Tensor Cores
+  # bfloat16: for A100/L4/H100
+  torch_dtype: "float16"
 
 # ── LoRA Adapter ──────────────────────────────────────────────────────────────
 lora:
@@ -37,16 +30,14 @@ dataset:
   hf_repo_id: "tirtho149/SAGE"   # HuggingFace dataset ID
 
   # ── DATA ACCESS MODE ──
-  # - "chunked": (RECOMMENDED) Rolling window: downloads 2 parquet files (~850MB),
-  #              trains with fast local I/O, immediately deletes them to free disk,
-  #              and loops through all 48 parquets. Peak disk usage stays < 1.3 GB!
-  # - "streaming": streams live from HF Hub over HTTP (slow, prone to network timeouts)
-  # - "local": reads pre-downloaded parquets from parquet_dir
+  # - "chunked": Rolling window: downloads 2 parquet files (~850MB),
+  #              trains with fast local I/O, immediately deletes them to free disk.
+  #              Peak disk usage stays < 1.3 GB!
   mode: "chunked"
   chunk_size: 2               # number of parquet files per chunk (keeps disk < 1.3 GB)
   total_shards: 48            # 48 shards in SAGE dataset (train-00000 to train-00047)
   chunk_dir: "/kaggle/working/data_cache"
-  max_chunks_per_epoch: null  # null = train on all shards; or set e.g. 5 for a quick test
+  max_chunks_per_epoch: 2     # 2 chunks = 4 shards (~10,000 images/epoch). Perfect for 16 classes!
 
   # Fallback paths for local or streaming modes:
   streaming: false
@@ -66,22 +57,19 @@ dataset:
 
 # ── Preprocessing / Vision Resolution ────────────────────────────────────────
 preprocessing:
-  # Higher = more image detail but more VRAM.
-  # T4 (16GB):   min=100352 / max=200704  (128–256 tokens, safe)
-  # L4 (24GB):   min=200704 / max=401408  (256–512 tokens)
-  # A100 (40GB): min=401408 / max=802816  (512–1024 tokens)
-  min_pixels: 100352
-  max_pixels: 200704
+  # 25088 - 50176 gives ~64 visual tokens (2-3x faster attention than 256 tokens)
+  min_pixels: 25088
+  max_pixels: 50176
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   seed: 42
 
-  # T4 16GB → batch 2–4 | L4 24GB → batch 4–8 | A100 → batch 8–16
-  batch_size: 2
+  # batch_size 4 utilizes GPU 0 memory well (~12-14 GB out of 16 GB)
+  batch_size: 4
 
-  # Effective batch = batch_size × gradient_accumulation_steps (aim for ≥32)
-  gradient_accumulation_steps: 16
+  # Effective batch = 4 * 8 = 32
+  gradient_accumulation_steps: 8
 
   learning_rate: 0.0001
   weight_decay: 0.01
@@ -90,8 +78,8 @@ training:
   early_stopping_patience: 7
 
   gradient_checkpointing: true
-  fp16: false   # true for T4/P100 (float16)
-  bf16: true    # true for A100/L4 (bfloat16); set false if using fp16
+  fp16: true    # native hardware acceleration on T4 Tensor Cores
+  bf16: false   # false on T4 (T4 does not have native bf16 Tensor Cores)
   max_grad_norm: 1.0
 
   # "adapter" = small ~50MB, needs PEFT at inference
