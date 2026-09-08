@@ -1,0 +1,66 @@
+# ============================================================
+# SAGE QLoRA Project — .gitignore
+# ============================================================
+
+# ----- Python -----------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.installed.cfg
+MANIFEST
+pip-wheel-metadata/
+
+# ----- Virtual envs / conda ---------------------------------
+.env
+.venv
+env/
+venv/
+ENV/
+*.conda
+
+# ----- Jupyter ----------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# ----- Dataset — large binary / generated files -------------
+# Raw HuggingFace arrow dataset (original, read-only source)
+SAGE-sample/
+
+# Extracted images (regeneratable from SAGE-sample via src/extract_dataset.py)
+data/processed/images/
+
+# Generated CSVs and reports (regeneratable)
+data/processed/metadata.csv
+data/processed/train.csv
+data/processed/val.csv
+data/processed/test.csv
+data/processed/labels.json
+data/reports/
+
+# ----- Model artefacts / training outputs -------------------
+checkpoints/
+outputs/
+logs/
+
+# ----- OS ---------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- IDEs -------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ----- Misc -------------------------------------------------
+*.log
+*.tmp
+*.bak
+*.orig

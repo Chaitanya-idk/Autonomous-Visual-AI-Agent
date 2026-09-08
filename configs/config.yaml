@@ -1,0 +1,54 @@
+# Configuration for SAGE Crop Disease Visual Diagnosis
+# Qwen2.5-VL-3B-Instruct + 4-bit NF4 QLoRA Pipeline
+
+model:
+  name_or_path: "Qwen/Qwen2.5-VL-3B-Instruct"
+  local_files_only: true
+  torch_dtype: "float16"
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "float16"
+  bnb_4bit_use_double_quant: true
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+preprocessing:
+  # 28 * 28 = 784 pixels per patch
+  factor: 784
+  # Conservative bounded resolution to maintain low token count & fits 4GB RTX 3050 Ti
+  min_pixels: 100352   # 128 * 784 (~144 visual tokens)
+  max_pixels: 200704   # 256 * 784 (~234 visual tokens)
+
+training:
+  seed: 42
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  num_epochs: 3
+  gradient_checkpointing: true
+  fp16: true
+  max_grad_norm: 1.0
+  eval_batch_size: 1
+
+paths:
+  train_csv: "data/processed/train.csv"
+  val_csv: "data/processed/val.csv"
+  test_csv: "data/processed/test.csv"
+  labels_json: "data/processed/labels.json"
+  checkpoint_dir: "checkpoints"
+  output_dir: "outputs"
+  log_dir: "logs"
