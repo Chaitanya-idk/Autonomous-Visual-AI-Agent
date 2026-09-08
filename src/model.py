@@ -11,6 +11,23 @@ from typing import Optional, List
 from transformers import Qwen2_5_VLForConditionalGeneration
 from peft import LoraConfig, get_peft_model, PeftModel
 
+# Kaggle / environment compatibility: handle outdated pre-installed torchao gracefully
+try:
+    import peft.import_utils
+    _orig_torchao_check = getattr(peft.import_utils, "is_torchao_available", None)
+    if _orig_torchao_check is not None:
+        def _safe_torchao_check():
+            try:
+                return _orig_torchao_check()
+            except ImportError:
+                return False
+        peft.import_utils.is_torchao_available = _safe_torchao_check
+    import peft.tuners.lora.torchao as _torchao_tuner
+    if hasattr(_torchao_tuner, "is_torchao_available"):
+        _torchao_tuner.is_torchao_available = _safe_torchao_check
+except Exception:
+    pass
+
 
 def get_qwen_lora_model(
     model_name_or_path: str = "Qwen/Qwen2.5-VL-3B-Instruct",
