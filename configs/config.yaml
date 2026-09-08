@@ -36,22 +36,24 @@ lora:
 dataset:
   hf_repo_id: "tirtho149/SAGE"   # HuggingFace dataset ID
 
-  # STREAMING MODE (recommended for 21GB dataset — zero download wait)
-  # Reads data directly from HuggingFace Hub over the network.
-  # Requires: Internet ON in Kaggle settings.
+  # STREAMING MODE vs LOCAL PARQUET:
+  # - streaming: true  → streams live from HF Hub (network dependent)
+  # - streaming: false → reads from local parquet files in parquet_dir (fastest)
   streaming: true
+  parquet_dir: "/kaggle/working/data"
 
-  # ── Column names — verify with: df.columns.tolist() on one parquet file ──
+  # ── Column names ──
   image_col: "image"       # PIL image or {"bytes": b"..."} dict
   disease_col: "disease"   # Disease name string (target label)
   crop_col: "crop"         # Crop type (set "" to disable)
   label_id_col: ""         # Integer label id (set "" if not in dataset)
 
-  # ── Streaming split sizes (number of samples, not ratios) ─────────────────
-  # Total SAGE dataset has ~100K-1M images; adjust to your GPU time budget.
-  # Kaggle free tier: ~9 hours — aim for ~50K–100K training samples.
-  train_size: 50000   # Number of streaming samples used for training per epoch
-  val_size: 5000      # Number of streaming samples used for validation
+  # ── Dataset sizes per epoch ───────────────────────────────────────────────
+  # For LoRA on 16 classes, 2000-4000 samples per epoch (~200/class) is ideal.
+  # 50,000 was 25,000 steps (45+ hours). 3200 samples = 1600 steps (~15-20 mins).
+  train_size: 3200    # Number of training samples per epoch
+  val_size: 400       # Number of validation samples per epoch
+  val_split: 0.15     # Used when streaming=false (local parquet mode)
   seed: 42
 
 # ── Preprocessing / Vision Resolution ────────────────────────────────────────
