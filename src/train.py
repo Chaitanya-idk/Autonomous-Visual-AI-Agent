@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor, get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -107,14 +108,17 @@ def build_datasets(cfg: Dict[str, Any], processor):
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-def validate(model, processor, val_loader, label2id, device, dtype, max_batches=200):
-    """Run validation — capped at max_batches for streaming mode."""
+def validate(model, processor, val_loader, label2id, device, dtype, max_batches=200, epoch=None):
+    """Run validation with progress bar — capped at max_batches for streaming mode."""
     model.eval()
     total_loss, count = 0.0, 0
     y_true, y_pred = [], []
 
+    desc = f"  Validation [Epoch {epoch}]" if epoch is not None else "  Validation"
+    val_pbar = tqdm(val_loader, total=max_batches, desc=desc, unit="batch", dynamic_ncols=True, leave=False)
+
     with torch.no_grad():
-        for i, batch in enumerate(val_loader):
+        for i, batch in enumerate(val_pbar):
             if i >= max_batches:
                 break
             ids  = batch["input_ids"].to(device)
@@ -139,8 +143,16 @@ def validate(model, processor, val_loader, label2id, device, dtype, max_batches=
                 gen_ids[0, ids.shape[1]:], skip_special_tokens=True).strip()
             _, pred_id, _ = match_prediction(raw, label2id)
 
-            y_true.extend(batch["label_id"].tolist())
-            y_pred.append(pred_id)
+            true_id = batch["label_id"][0].item() if "label_id" in batch else -1
+            if true_id >= 0:
+                y_true.append(true_id)
+                y_pred.append(pred_id)
+
+            cur_acc = (sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp) / len(y_true)) if y_true else 0.0
+            val_pbar.set_postfix({
+                "val_loss": f"{total_loss / count:.4f}",
+                "acc": f"{cur_acc:.2%}",
+            })
 
     metrics = compute_classification_metrics(y_true, y_pred)
     metrics["val_loss"] = total_loss / max(1, count)
@@ -254,8 +266,16 @@ def train(cfg: Dict[str, Any]):
         step       = 0
         t0         = time.time()
         optimizer.zero_grad()
+        pbar = tqdm(
+            train_loader,
+            total=steps_per_epoch,
+            desc=f"Epoch {epoch}/{num_epochs}",
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+        )
 
-        for batch in train_loader:
+        for batch in pbar:
             ids  = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
             pv   = batch["pixel_values"].to(device, dtype=dtype)
@@ -280,22 +300,37 @@ def train(cfg: Dict[str, Any]):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                opt_step = step // grad_accum
-                if opt_step % 20 == 0:
-                    print(f"  Ep {epoch} | step {step} | "
-                          f"loss {epoch_loss/step:.4f} | lr {scheduler.get_last_lr()[0]:.2e}",
-                          flush=True)
+            # Dynamic speed & progress metrics
+            elapsed_sec   = time.time() - t0
+            items_per_sec = (step * batch_size) / max(elapsed_sec, 0.001)
+            postfix = {
+                "loss": f"{epoch_loss / step:.4f}",
+                "items/s": f"{items_per_sec:.1f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.1e}",
+            }
+            if torch.cuda.is_available():
+                postfix["vram"] = f"{torch.cuda.memory_allocated() / (1024**3):.1f}GB"
+
+            pbar.set_postfix(postfix)
+
+            # Cap streaming epoch to steps_per_epoch
+            if is_streaming and step >= steps_per_epoch:
+                break
 
         elapsed = time.time() - t0
         avg_loss = epoch_loss / max(step, 1)
-        print(f"\nEpoch {epoch} done in {elapsed:.0f}s | avg_loss={avg_loss:.4f}")
+        total_items = step * batch_size
+        overall_throughput = total_items / max(elapsed, 0.001)
+        print(f"\n[Epoch {epoch} Done] {step}/{steps_per_epoch} steps | "
+              f"{total_items} items in {elapsed:.1f}s ({overall_throughput:.1f} items/s) | "
+              f"avg_loss={avg_loss:.4f}")
 
-        # Validation (cap at 200 batches for streaming)
+        # Validation (with progress bar)
         val_metrics = validate(model, processor, val_loader, label2id,
-                               device, dtype, max_batches=200)
+                               device, dtype, max_batches=200, epoch=epoch)
         macro_f1 = val_metrics["macro_f1"]
-        print(f"[VAL] loss={val_metrics['val_loss']:.4f} | "
-              f"acc={val_metrics['accuracy']:.4f} | macro_f1={macro_f1:.4f}")
+        print(f"[VAL Epoch {epoch}] loss={val_metrics['val_loss']:.4f} | "
+              f"acc={val_metrics['accuracy']:.4f} | macro_f1={macro_f1:.4f}\n")
 
         logs.append({"epoch": epoch, "train_loss": avg_loss, "time_sec": elapsed, **val_metrics})
         pd.DataFrame(logs).to_csv(log_dir / "training_log.csv", index=False)
