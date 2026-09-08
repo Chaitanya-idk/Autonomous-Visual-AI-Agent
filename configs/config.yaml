@@ -1,21 +1,26 @@
-# Configuration for SAGE Crop Disease Visual Diagnosis
-# Qwen2.5-VL-3B-Instruct + 4-bit NF4 QLoRA Pipeline
+# ============================================================
+# SAGE Crop Disease — LoRA Fine-Tuning Configuration
+# Model: Qwen2.5-VL-3B-Instruct (full precision, no quantization)
+# Target: GCP Compute Engine / Vertex AI / Kaggle (T4/L4/A100)
+# ============================================================
 
 model:
+  # HuggingFace model name — downloaded automatically on first run
   name_or_path: "Qwen/Qwen2.5-VL-3B-Instruct"
-  local_files_only: true
-  torch_dtype: "float16"
+  # Set to true for air-gapped environments; false for Kaggle/GCP with internet
+  local_files_only: false
+  # Use bfloat16 for better numerical stability on modern GPUs (A100, L4)
+  # Use float16 if on T4 / P100 (older GPUs that don't natively support bf16)
+  torch_dtype: "bfloat16"
 
-quantization:
-  load_in_4bit: true
-  bnb_4bit_quant_type: "nf4"
-  bnb_4bit_compute_dtype: "float16"
-  bnb_4bit_use_double_quant: true
-
+# ── LoRA Adapter Configuration ────────────────────────────────────────────────
 lora:
-  r: 16
-  lora_alpha: 32
+  # Rank — higher = more capacity but more memory (16–64 typical)
+  r: 32
+  # Alpha scaling factor (usually 2x rank)
+  lora_alpha: 64
   lora_dropout: 0.05
+  # Modules to apply LoRA to (vision + language attention projections)
   target_modules:
     - "q_proj"
     - "k_proj"
@@ -24,31 +29,88 @@ lora:
   bias: "none"
   task_type: "CAUSAL_LM"
 
-preprocessing:
-  # 28 * 28 = 784 pixels per patch
-  factor: 784
-  # Resolution bounded to fit 4GB RTX 3050 Ti VRAM (tested: peak allocated 3.83 GB <= 4.00 GB)
-  min_pixels: 25088    # 32 * 784 (~32 visual tokens)
-  max_pixels: 50176    # 64 * 784 (~64 visual tokens)
+# ── Dataset Configuration ─────────────────────────────────────────────────────
+dataset:
+  # HuggingFace dataset repo ID (used when use_hf_hub: true)
+  hf_repo_id: "tirtho149/SAGE"
 
+  # Set to true to stream/download from HuggingFace Hub (needs internet)
+  # Set to false to load from local parquet files (parquet_dir below)
+  use_hf_hub: false
+
+  # Path to folder containing .parquet files when use_hf_hub is false
+  # Kaggle example: "/kaggle/input/sage/data"
+  # GCP example:    "/home/user/sage-data/data"
+  parquet_dir: "data/parquet"
+
+  # --- Column names in your parquet/HF dataset ---
+  # Run: df.columns.tolist() on a sample row to verify these
+  image_col: "image"       # Column holding image (PIL or {"bytes":...} dict)
+  disease_col: "disease"   # Target label column (the disease name string)
+  crop_col: "crop"         # Optional crop type column (set to "" to disable)
+  label_id_col: "label_id" # Integer label index column (set to "" if absent)
+
+  # Canonical label mapping JSON (optional, from tirtho149/SAGE repo)
+  # Set to "" to disable; labels inferred from data instead
+  canonical_mapping: ""    # e.g. "canonical_mapping.json"
+
+  # Train / val / test split ratios (only used when splitting locally)
+  val_split: 0.15
+  test_split: 0.10
+  seed: 42
+
+# ── Preprocessing / Vision Resolution ────────────────────────────────────────
+preprocessing:
+  # Visual token budget per image (28×28 = 784 pixels per patch)
+  # Higher = more detail but more VRAM.
+  # Examples:
+  #   min=100352 / max=200704  →  128–256 visual tokens  (T4 16GB, safe)
+  #   min=200704 / max=401408  →  256–512 visual tokens  (L4 24GB / A100)
+  #   min=401408 / max=802816  →  512–1024 visual tokens (A100 80GB)
+  # Set both to null to use the model's default (full resolution, most VRAM)
+  min_pixels: 200704   # 256 visual tokens
+  max_pixels: 401408   # 512 visual tokens
+
+# ── Training Hyperparameters ─────────────────────────────────────────────────
 training:
   seed: 42
-  batch_size: 1
+
+  # Per-GPU batch size.
+  # T4 16GB  → 2–4 with LoRA + 256-512 visual tokens
+  # L4 24GB  → 4–8
+  # A100 40GB → 8–16
+  batch_size: 4
+
+  # Effective batch = batch_size * gradient_accumulation_steps
+  # Keep effective batch ≥ 32 for stable VLM fine-tuning
   gradient_accumulation_steps: 8
-  learning_rate: 0.0002
+
+  learning_rate: 0.0001
   weight_decay: 0.01
   warmup_ratio: 0.05
-  num_epochs: 3
+  num_epochs: 10
+
+  # Stop training if val macro-F1 does not improve for this many epochs
+  early_stopping_patience: 7
+
   gradient_checkpointing: true
-  fp16: true
+  fp16: false      # Use with float16 dtype (older GPUs)
+  bf16: true       # Use with bfloat16 dtype (A100, L4, etc.)
   max_grad_norm: 1.0
   eval_batch_size: 1
 
+  # Save adapter-only or merged full model
+  # "adapter" = small (~50–200MB), requires PEFT at inference
+  # "merged"  = full model (~7GB), self-contained for deployment
+  save_mode: "adapter"
+
+# ── Output Paths ─────────────────────────────────────────────────────────────
 paths:
-  train_csv: "data/processed/train.csv"
-  val_csv: "data/processed/val.csv"
-  test_csv: "data/processed/test.csv"
-  labels_json: "data/processed/labels.json"
+  # Folder to save LoRA adapters / merged weights
   checkpoint_dir: "checkpoints"
+  # Folder for evaluation outputs, metrics, figures
   output_dir: "outputs"
+  # Training logs (CSV per epoch)
   log_dir: "logs"
+  # Optional: labels vocab JSON (auto-generated from data if not present)
+  labels_json: "data/labels.json"

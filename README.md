@@ -1,135 +1,92 @@
 # SAGE — Crop Disease Visual Diagnosis
 
-QLoRA fine-tuning of **Qwen2.5-VL-3B-Instruct** on the SAGE crop disease image dataset for automated visual diagnosis. Built for 100% offline local execution and Cloud migration (Google Cloud Platform / Compute Engine / Vertex AI).
+LoRA fine-tuning of **Qwen2.5-VL-3B-Instruct** on the [tirtho149/SAGE](https://huggingface.co/datasets/tirtho149/SAGE) dataset (21.4 GB, ~100K-1M images) for automated crop disease classification.
 
-## Architecture & Tech Stack
+**Full precision (bfloat16) LoRA — no quantization — designed for GCP / Kaggle GPU instances.**
+
+## Architecture
 
 | Component | Detail |
 |-----------|--------|
-| Base model | `Qwen2.5-VL-3B-Instruct` (local / HF hub) |
-| Quantisation | 4-bit NF4 via `bitsandbytes` |
-| Fine-tuning | QLoRA — adapters on `q_proj, k_proj, v_proj, o_proj` |
-| Task | Multi-class crop disease visual classification |
-| Supported Hardware | Local GPU (RTX 3050 Ti 4GB+) or GCP VM (T4, L4, V100, A100) |
+| Base model | `Qwen2.5-VL-3B-Instruct` |
+| Fine-tuning | Full LoRA (r=32, α=64) on `q/k/v/o_proj` |
+| Precision | bfloat16 (no quantization) |
+| Dataset | tirtho149/SAGE — parquet format |
+| Hardware | Kaggle T4 (16GB) / GCP L4 (24GB) / A100 |
 
-## Project Structure
+## Repo Structure
 
 ```
-dataset_loader/
 ├── configs/
-│   └── config.yaml          # All hyperparameters (model, LoRA, visual tokens, training)
-├── data/
-│   ├── processed/           # ← gitignored, regeneratable
-│   │   ├── images/          #   Extracted JPEGs (000001.jpg …)
-│   │   ├── metadata.csv     #   Full image manifest
-│   │   ├── train.csv        #   Training split
-│   │   ├── val.csv          #   Validation split
-│   │   └── test.csv         #   Test split
-│   └── reports/             # ← gitignored, audit/split reports
-├── scripts/
-│   ├── gcp_setup.sh         # GCP VM / Vertex AI automated setup script
-│   └── sync_to_gcs.sh       # Sync checkpoints and logs to Google Cloud Storage (GCS)
+│   └── config.yaml          # ← Edit this to configure paths, resolution, epochs
 ├── src/
-│   ├── __init__.py
-│   ├── inspect_dataset.py   # Step 1 — inspect raw HF dataset
-│   ├── extract_dataset.py   # Step 2 — extract images + metadata.csv
-│   ├── audit_dataset.py     # Step 3 — quality audit
-│   ├── prepare_splits.py    # Step 4 — stratified train/val/test split
-│   ├── preprocessing.py     # Qwen processor + resolution benchmarking
-│   ├── prompts.py           # Conversation template builder
-│   ├── dataset.py           # PyTorch Dataset + DataLoader
-│   ├── model.py             # QLoRA model loading (4-bit NF4)
-│   ├── benchmark_vram.py    # Visual token memory benchmarking module
-│   ├── benchmark_memory.py  # Single-step memory benchmark
-│   ├── train.py             # Sanity check, preflight test & full baseline training
-│   ├── evaluate.py          # Test set evaluation & metrics calculation
-│   ├── plot_results.py      # Plotting confusion matrices & error analysis
-│   └── report.py            # Final summary report generator
-├── requirements.txt         # Production dependencies for Local & GCP
-├── .gitignore               # Comprehensive gitignore for Python, GCP, models & datasets
-├── checkpoints/             # ← gitignored, saved LoRA adapters
-├── outputs/                 # ← gitignored, evaluation predictions & figures
-└── logs/                    # ← gitignored, training logs
+│   ├── dataset.py           # Parquet → PyTorch Dataset (supports HF Hub + local)
+│   ├── model.py             # Full LoRA model loading
+│   ├── train.py             # Training loop + early stopping
+│   ├── prompts.py           # Qwen2.5-VL conversation builder
+│   └── utils.py             # Seeds, metrics
+├── scripts/
+│   ├── gcp_setup.sh         # GCP VM automated setup
+│   ├── upload_to_gcs.sh     # Upload data to GCS bucket
+│   └── sync_to_gcs.sh       # Sync outputs back to GCS
+├── requirements.txt
+└── .gitignore
 ```
 
-## Quick Start (Local Setup)
+## Kaggle Quick Start
 
-### 1 — Environment & Installation
+### 1 — Add the SAGE dataset on Kaggle
+1. Go to [tirtho149/SAGE on HuggingFace](https://huggingface.co/datasets/tirtho149/SAGE)
+2. Download parquet files and add as a Kaggle dataset, **or** use the HuggingFace datasets API directly.
 
-```bash
-# Clone the repository
-git clone https://github.com/Chaitanya-idk/Autonomous-Visual-AI-Agent.git
-cd Autonomous-Visual-AI-Agent/dataset_loader
-
-# Create conda environment or virtualenv
-conda create -n ai python=3.12 -y
-conda activate ai
-
-# Install requirements
-pip install -r requirements.txt
+### 2 — Clone this repo into your Kaggle notebook
+```python
+!git clone https://github.com/Chaitanya-idk/Autonomous-Visual-AI-Agent.git
+%cd Autonomous-Visual-AI-Agent/dataset_loader
+!pip install -r requirements.txt
 ```
 
----
-
-## ☁️ Google Cloud Platform (GCP) Migration Guide
-
-### Option A — GCP Compute Engine VM (Recommended)
-
-1. **Spin up a GPU VM Instance**:
-   - Machine Type: `n1-standard-4` or `g2-standard-4`
-   - GPU: 1x NVIDIA T4 (16 GB VRAM) or 1x NVIDIA L4 (24 GB VRAM)
-   - OS Image: **Deep Learning VM Image (CUDA 12.1 / PyTorch 2.1)**
-
-2. **Clone repo & Run Automated GCP Setup**:
-   ```bash
-   git clone https://github.com/Chaitanya-idk/Autonomous-Visual-AI-Agent.git
-   cd Autonomous-Visual-AI-Agent/dataset_loader
-   chmod +x scripts/*.sh
-   ./scripts/gcp_setup.sh
-   ```
-
-3. **Google Cloud Storage (GCS) Integration**:
-   - Upload dataset or checkpoints to GCS:
-     ```bash
-     export GCS_BUCKET="your-sage-bucket-name"
-     ./scripts/sync_to_gcs.sh
-     ```
-
-### Option B — Vertex AI Workbench / Custom Container
-
-- Ensure container environment specifies `transformers>=4.48.0`, `bitsandbytes>=0.43.0`, `peft>=0.10.0`.
-- All outputs will auto-save to `checkpoints/` and `outputs/`.
-
----
-
-## Training Pipeline Commands
-
-### 1 — Dataset Processing & Pipeline Verification
-```bash
-python -m src.extract_dataset
-python -m src.prepare_splits
-python -m src.dataset
+### 3 — Configure paths in `configs/config.yaml`
+```yaml
+dataset:
+  use_hf_hub: false
+  parquet_dir: "/kaggle/input/sage/data"   # ← path to your parquet files on Kaggle
+  image_col: "image"                        # ← verify against your parquet schema
+  disease_col: "disease"                    # ← verify against your parquet schema
 ```
 
-### 2 — Run 50-Step Preflight Check (Safety & Memory Verification)
-```bash
-python -m src.train --preflight
-```
-
-### 3 — Run Baseline QLoRA Training
+### 4 — Run training
 ```bash
 python -m src.train
 ```
 
-### 4 — Evaluate on Test Set & Plot Results
+---
+
+## GCP Setup
+
 ```bash
-python -m src.evaluate
-python -m src.plot_results
-python -m src.report
+export GCS_BUCKET="your-sage-bucket"
+chmod +x scripts/*.sh
+./scripts/gcp_setup.sh
+python -m src.train
+./scripts/sync_to_gcs.sh    # sync checkpoints after training
 ```
 
-## Key Technical Decisions
+## Verify your parquet schema
 
-- **Resolution Bounded (32–64 tokens)**: `min_pixels=25088`, `max_pixels=50176` ensures peak VRAM stays safe (~3.83 GB) for low-memory GPUs, while scaling seamlessly on cloud GPUs (T4/L4/A100).
-- **PagedAdamW8bit & FP16**: Reduced memory footprint for optimizer state.
-- **`engine='python'` in CSV parsing**: Prevents Windows MKL / native C parser DLL conflicts.
+Before running, check what columns your parquet files actually have:
+```python
+import pandas as pd
+df = pd.read_parquet("/path/to/one/file.parquet", engine="pyarrow")
+print(df.columns.tolist())
+print(df.iloc[0])  # inspect first row + image column format
+```
+
+Update `configs/config.yaml` → `dataset.*_col` fields to match.
+
+## Key Design Notes
+
+- **No image extraction needed** — images are decoded directly from parquet bytes at runtime.
+- **Early stopping** at patience=7 prevents overfitting on noisy agricultural images.
+- **LoRA adapter checkpoints** are ~50–200 MB regardless of model size (base model NOT included).
+- To produce a self-contained deployment model: set `save_mode: merged` in config (saves ~7 GB).

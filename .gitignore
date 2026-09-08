@@ -1,86 +1,55 @@
 # ============================================================
-# SAGE QLoRA Project — .gitignore
+# SAGE Crop Disease Visual Diagnosis — .gitignore
 # ============================================================
 
-# ----- Python & Caching --------------------------------------
+# ----- Python -----------------------------------------------
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 *.egg
 *.egg-info/
 dist/
 build/
-.eggs/
-.installed.cfg
-MANIFEST
-pip-wheel-metadata/
 .pytest_cache/
-.coverage
 
-# ----- Virtual Environments & Conda -------------------------
+# ----- Virtual Environments ---------------------------------
 .env
 .venv
 env/
 venv/
-ENV/
 *.conda
 
-# ----- Jupyter Notebooks -------------------------------------
-.ipynb_checkpoints/
-*.ipynb
-
-# ----- Dataset & Large Data Directories ----------------------
-# Raw HuggingFace arrow dataset (original, read-only source)
+# ----- Dataset (large binary files — store in GCS/Kaggle) ---
+# Raw parquet files (download separately on Kaggle/GCP)
+data/parquet/
+# Old extraction pipeline artifacts (no longer needed)
+data/processed/
 SAGE-sample/
 
-# Extracted images (regeneratable via src/extract_dataset.py)
-data/processed/images/
-
-# Generated CSVs and reports (regeneratable)
-data/processed/metadata.csv
-data/processed/train.csv
-data/processed/val.csv
-data/processed/test.csv
-data/processed/labels.json
-data/reports/
-
-# ----- Model Artifacts, Weights & Training Outputs -----------
+# ----- Model Weights & Training Outputs ---------------------
 checkpoints/
 outputs/
 logs/
-hf_cache/
-.cache/
 *.pt
 *.pth
 *.bin
 *.safetensors
 *.onnx
 
-# ----- GCP & Cloud Storage / Credentials ---------------------
+# ----- GCP / Cloud Credentials ------------------------------
 .gcloud/
-.gcp/
-*.json-key
 *credentials*.json
 *.gcloudignore
 
-# ----- Experiment Trackers & Logs ----------------------------
-wandb/
-runs/
-tensorboard/
-*.log
-
-# ----- OS & IDE Files ----------------------------------------
+# ----- OS & IDE ---------------------------------------------
 .DS_Store
 Thumbs.db
 desktop.ini
 .vscode/
 .idea/
 *.swp
-*.swo
-.gemini/
 
-# ----- Miscellaneous -----------------------------------------
+# ----- Misc -------------------------------------------------
+*.log
 *.tmp
-*.bak
-*.orig
+wandb/

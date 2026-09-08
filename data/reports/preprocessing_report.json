@@ -1,0 +1,85 @@
+{
+  "timestamp": "2026-09-08T12:48:36.841567",
+  "project_root": "C:\\Projects\\Autonomous-visual-ai-Agent2\\dataset_loader",
+  "metadata_path": "C:\\Projects\\Autonomous-visual-ai-Agent2\\dataset_loader\\data\\processed\\metadata.csv",
+  "images_directory": "C:\\Projects\\Autonomous-visual-ai-Agent2\\dataset_loader\\data\\processed\\images",
+  "total_metadata_records": 1848,
+  "benchmark_images_count": 10,
+  "missing_images_count": 0,
+  "corrupt_images_count": 0,
+  "model_identifier": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "resolution_presets": {
+    "LOW": {
+      "min_pixels": 100352,
+      "max_pixels": 200704,
+      "tested_images_count": 10,
+      "success_count": 10,
+      "failure_count": 0,
+      "avg_preprocessing_time_ms": 41.79,
+      "avg_visual_tokens": 188.4,
+      "min_visual_tokens": 144,
+      "max_visual_tokens": 234,
+      "tokens_per_image": [
+        144,
+        144,
+        144,
+        144,
+        234,
+        234,
+        234,
+        228,
+        144,
+        234
+      ],
+      "errors": []
+    },
+    "MEDIUM": {
+      "min_pixels": 200704,
+      "max_pixels": 401408,
+      "tested_images_count": 10,
+      "success_count": 10,
+      "failure_count": 0,
+      "avg_preprocessing_time_ms": 41.7,
+      "avg_visual_tokens": 375.0,
+      "min_visual_tokens": 256,
+      "max_visual_tokens": 494,
+      "tokens_per_image": [
+        256,
+        256,
+        256,
+        256,
+        494,
+        494,
+        494,
+        486,
+        264,
+        494
+      ],
+      "errors": []
+    },
+    "HIGH": {
+      "min_pixels": 301056,
+      "max_pixels": 602112,
+      "tested_images_count": 10,
+      "success_count": 10,
+      "failure_count": 0,
+      "avg_preprocessing_time_ms": 34.63,
+      "avg_visual_tokens": 574.5,
+      "min_visual_tokens": 400,
+      "max_visual_tokens": 768,
+      "tokens_per_image": [
+        400,
+        400,
+        400,
+        400,
+        744,
+        768,
+        744,
+        748,
+        405,
+        736
+      ],
+      "errors": []
+    }
+  }
+}

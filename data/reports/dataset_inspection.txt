@@ -1,0 +1,59 @@
+============================================================
+SAGE-SAMPLE DATASET INSPECTION REPORT
+============================================================
+
+Dataset Path: C:\Projects\Autonomous-visual-ai-Agent2\dataset_loader\SAGE-sample
+Splits: ['train']
+
+--- SPLIT: train ---
+Total records: 1848
+Features: ['image', 'crop', 'disease', 'filename']
+Missing images: 0
+Corrupted images: 0
+Unique Crops: 10
+Unique Diseases: 294
+Unique Filenames: 832 (Duplicates: 1016)
+Unique Image Hashes: 1831 (Duplicates: 17)
+
+Image Dimensions:
+  Width:  min=64, max=5184, mean=1854.6
+  Height: min=64, max=4608, mean=1509.8
+  Modes: {'RGB': 1847, 'RGBA': 1}
+  Formats: {'PNG': 60, 'JPEG': 1296, 'UNKNOWN': 492}
+  Top 10 resolutions: [((3072, 2304), 132), ((256, 256), 125), ((1536, 1152), 103), ((3072, 2048), 78), ((300, 300), 54), ((768, 1024), 54), ((64, 64), 52), ((224, 224), 52), ((2288, 1712), 41), ((1535, 1151), 39)]
+
+Rare Classes Summary:
+  Classes with 1 sample: 24
+  Classes with 2 samples: 28
+  Classes with <5 samples: 104
+  Classes with >=5 samples: 190
+
+Crops breakdown:
+  - Corn: 420
+  - Soybean: 304
+  - Tomato: 228
+  - Wheat: 224
+  - Potato: 178
+  - Rice: 170
+  - Apple: 131
+  - Sugarcane: 110
+  - Cotton: 47
+  - Mango: 36
+
+Top 15 Most Common Diseases:
+  - Powdery_Mildew: 38
+  - Anthracnose: 30
+  - Brown_Spot: 29
+  - Fusarium_Wilts: 28
+  - Rhizoctonia_Damping-Off: 27
+  - Charcoal_Rot: 21
+  - Rust: 19
+  - Fusarium_Disease: 19
+  - Southern_Blight: 19
+  - Target_Spot: 18
+  - Leaf_Mosaic_Virus: 18
+  - Early_Blight: 17
+  - Downy_Mildew: 16
+  - Sclerotinia_Timber_Rot: 16
+  - Frogeye_Leaf_Spot: 16
+

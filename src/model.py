@@ -1,153 +1,93 @@
 """
-Model implementation for SAGE crop disease diagnosis.
-Loads Qwen2.5-VL-3B-Instruct in 4-bit NF4 with PEFT LoRA adapters.
+Model loading: Qwen2.5-VL with full-precision LoRA (no quantization).
+Designed for GCP / Kaggle GPU instances (T4 16GB, L4 24GB, A100).
 """
 
 import sys
 import torch
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, List
 
-from transformers import (
-    Qwen2_5_VLForConditionalGeneration,
-    BitsAndBytesConfig
-)
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    PeftModel
-)
+from transformers import Qwen2_5_VLForConditionalGeneration
+from peft import LoraConfig, get_peft_model, PeftModel
 
-def print_model_parameter_summary(model, lora_config=None, bnb_config=None):
-    """
-    Computes and prints total and trainable parameter counts and configurations.
-    Fails if trainable parameter count is unexpectedly high.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        num_params = param.numel()
-        all_param += num_params
-        if param.requires_grad:
-            trainable_params += num_params
-            
-    pct_trainable = 100 * trainable_params / all_param if all_param > 0 else 0.0
-    
-    print("=" * 60)
-    print("MODEL & PARAMETER SUMMARY")
-    print("=" * 60)
-    print(f"Total parameters:      {all_param:,}")
-    print(f"Trainable parameters:  {trainable_params:,}")
-    print(f"Trainable percentage:  {pct_trainable:.4f}%")
-    print(f"Quantization:          4-bit NF4 (double quant: True, compute dtype: torch.float16)")
-    if lora_config:
-        print(f"LoRA Rank (r):         {lora_config.r}")
-        print(f"LoRA Alpha:            {lora_config.lora_alpha}")
-        print(f"LoRA Dropout:          {lora_config.lora_dropout}")
-        print(f"Target Modules:        {lora_config.target_modules}")
-    print(f"Device:                {next(model.parameters()).device}")
-    print(f"Dtype:                 {next(model.parameters()).dtype}")
-    print("=" * 60)
-    
-    # Fail-safe check
-    if pct_trainable > 10.0:
-        raise ValueError(
-            f"SAFETY ALERT: Trainable parameters ({pct_trainable:.2f}%) are unexpectedly high! "
-            f"Base model may not be frozen. Refusing to start training."
-        )
-    if trainable_params == 0 and getattr(model, "is_training", False):
-        raise ValueError("SAFETY ALERT: Trainable parameter count is 0 for training mode!")
-        
-    return {
-        "total_params": all_param,
-        "trainable_params": trainable_params,
-        "trainable_percentage": pct_trainable
-    }
 
-def get_qwen_qlora_model(
+def get_qwen_lora_model(
     model_name_or_path: str = "Qwen/Qwen2.5-VL-3B-Instruct",
-    lora_r: int = 16,
-    lora_alpha: int = 32,
+    lora_r: int = 32,
+    lora_alpha: int = 64,
     lora_dropout: float = 0.05,
-    target_modules: Optional[list] = None,
+    target_modules: Optional[List[str]] = None,
+    torch_dtype: str = "bfloat16",
     gradient_checkpointing: bool = True,
-    device_map: str = "auto",
-    is_trainable: bool = True
+    local_files_only: bool = False,
+    is_trainable: bool = True,
 ):
     """
-    Loads Qwen2.5-VL-3B-Instruct in 4-bit NF4 and applies PEFT LoRA.
+    Loads Qwen2.5-VL in full precision (bfloat16 or float16) and applies LoRA.
+    No quantization — requires ~7 GB VRAM for 3B model base.
     """
     if target_modules is None:
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-        
-    print(f"Configuring 4-bit NF4 Quantization for {model_name_or_path}...")
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True
-    )
-    
-    print("Loading base Qwen2.5-VL model (offline/local cache)...")
-    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+
+    dtype = torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
+
+    print(f"Loading {model_name_or_path} in {torch_dtype}...")
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name_or_path,
-        quantization_config=bnb_config,
-        device_map=device_map,
-        torch_dtype=torch.float16,
-        local_files_only=True
+        torch_dtype=dtype,
+        device_map="auto",
+        local_files_only=local_files_only,
     )
-    
+
     if is_trainable:
-        # Prepare for kbit training
-        base_model = prepare_model_for_kbit_training(
-            base_model,
-            use_gradient_checkpointing=gradient_checkpointing
-        )
-        
+        if gradient_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            model.config.use_cache = False
+
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             target_modules=target_modules,
             bias="none",
-            task_type="CAUSAL_LM"
+            task_type="CAUSAL_LM",
         )
-        
-        model = get_peft_model(base_model, lora_config)
-        model.is_training = True
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
     else:
-        model = base_model
-        lora_config = None
-        
-    print_model_parameter_summary(model, lora_config=lora_config, bnb_config=bnb_config)
+        model.eval()
+
     return model
+
 
 def load_trained_lora_model(
     adapter_path: str,
     base_model_name_or_path: str = "Qwen/Qwen2.5-VL-3B-Instruct",
-    device_map: str = "auto"
+    torch_dtype: str = "bfloat16",
+    local_files_only: bool = False,
+    merge_weights: bool = False,
 ):
     """
-    Loads base model in 4-bit and loads saved LoRA adapter checkpoint.
+    Loads base model and applies saved LoRA adapter.
+    Set merge_weights=True to produce a self-contained model (no PEFT needed at inference).
     """
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True
-    )
-    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        base_model_name_or_path,
-        quantization_config=bnb_config,
-        device_map=device_map,
-        torch_dtype=torch.float16,
-        local_files_only=True
-    )
-    model = PeftModel.from_pretrained(base_model, adapter_path)
-    model.eval()
-    print(f"Loaded LoRA adapter from: {adapter_path}")
-    return model
+    dtype = torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
 
-if __name__ == "__main__":
-    model = get_qwen_qlora_model()
+    base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        base_model_name_or_path,
+        torch_dtype=dtype,
+        device_map="auto",
+        local_files_only=local_files_only,
+    )
+    model = PeftModel.from_pretrained(base, adapter_path)
+
+    if merge_weights:
+        print("Merging LoRA weights into base model...")
+        model = model.merge_and_unload()
+
+    model.eval()
+    print(f"[OK] LoRA adapter loaded from: {adapter_path}")
+    return model
