@@ -229,7 +229,6 @@ def train(cfg: Dict[str, Any]):
     batch_size = train_cfg.get("batch_size", 2)
 
     common = dict(
-        processor=processor,
         image_col=ds_cfg.get("image_col", "image"),
         disease_col=ds_cfg.get("disease_col", "disease"),
         crop_col=ds_cfg.get("crop_col", "crop"),
