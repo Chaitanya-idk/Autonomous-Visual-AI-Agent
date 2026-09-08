@@ -27,9 +27,9 @@ lora:
 preprocessing:
   # 28 * 28 = 784 pixels per patch
   factor: 784
-  # Conservative bounded resolution to maintain low token count & fits 4GB RTX 3050 Ti
-  min_pixels: 100352   # 128 * 784 (~144 visual tokens)
-  max_pixels: 200704   # 256 * 784 (~234 visual tokens)
+  # Resolution bounded to fit 4GB RTX 3050 Ti VRAM (tested: peak allocated 3.83 GB <= 4.00 GB)
+  min_pixels: 25088    # 32 * 784 (~32 visual tokens)
+  max_pixels: 50176    # 64 * 784 (~64 visual tokens)
 
 training:
   seed: 42

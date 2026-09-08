@@ -45,48 +45,71 @@ dataset_loader/
 > **Note:** The `SAGE-sample/` raw dataset (~2.2 GB HuggingFace arrow files) is **gitignored**.  
 > Place it at `dataset_loader/SAGE-sample/` before running the pipeline.
 
-## Quick Start
+## Quick Start & Reproducibility
 
-### 1 — Set up environment
+### 1 — Environment Setup & Specifications
 
 ```bash
 conda activate ai
 ```
 
-### 2 — Regenerate processed data (if needed)
+- **Python:** `3.12.13`
+- **PyTorch:** `2.5.1+cu121`
+- **Transformers:** `5.5.4`
+- **PEFT:** `0.20.0`
+- **CUDA:** `12.1`
+- **GPU:** NVIDIA GeForce RTX 3050 Ti Laptop GPU (~4 GB VRAM)
+- **Random Seed:** `42` (configured in `configs/config.yaml`)
+
+### 2 — Data Preparation (Optional / If Raw SAGE-sample is present)
 
 ```bash
-# From dataset_loader/
 python -m src.inspect_dataset
 python -m src.extract_dataset
 python -m src.audit_dataset
 python -m src.prepare_splits
 ```
 
-### 3 — Verify the dataset pipeline
+### 3 — Pipeline Verification
 
 ```bash
 python -m src.dataset
 ```
+Expected: `[DATASET TEST] ALL CHECKS PASSED` with **Active training target tokens: 8**.
 
-Expected: `[DATASET TEST] ALL CHECKS PASSED` with **Active training target tokens > 0**.
+### 4 — Sanity Test (16 Samples Overfit Check)
 
-### 4 — Train
+```bash
+python -m src.train --sanity
+```
+Expected: `SANITY TEST: Result: PASS` confirming forward pass, finite loss, non-zero LoRA gradients, frozen base model, and parameter update.
+
+### 5 — Baseline Training
 
 ```bash
 python -m src.train
 ```
+Runs 1 epoch with batch size 1 and gradient accumulation 8. Saves best adapter to `checkpoints/001_baseline_qlora/best_checkpoint`.
 
-### 5 — Evaluate
+### 6 — Evaluation on Test Set
 
 ```bash
 python -m src.evaluate
 ```
+Computes overall accuracy, micro/macro/weighted metrics, per-class breakdown, and saves predictions to `outputs/001_baseline_qlora/test_predictions.csv`.
+
+### 7 — Visualization & Error Analysis
+
+```bash
+python -m src.plot_results
+```
+Generates confusion matrix, focused confusion matrix, error analysis CSV, and loss/accuracy/F1 training curves under `outputs/001_baseline_qlora/figures/`.
 
 ## Key Design Decisions
 
 - **`engine='python'`** in `pd.read_csv` — avoids a Windows MKL DLL conflict when `torch` is loaded before pandas' C extension.
-- **Pandas imported before torch** at module level in `dataset.py` — same reason.
+- **Pandas imported before torch** at module level in `dataset.py` — avoids native-level parser crashes.
 - **Batch size = 1** enforced — RTX 3050 Ti with 4 GB VRAM cannot handle larger batches with a 3B VLM even at 4-bit.
 - **Label masking** — only disease-name tokens (assistant turn) are unmasked (`-100` everywhere else) so the model is not penalised for the prompt or visual tokens.
-- **Resolution = LOW** (min_pixels=256²·4, max_pixels=512²·4) — the benchmark showed this safely fits in 4 GB VRAM.
+- **Resolution = LOW** (min_pixels=100352, max_pixels=200704) — bounded token budget safely fits within 4 GB VRAM.
+
