@@ -18,7 +18,7 @@ qwen-vl-utils>=0.0.8
 
 # ----- Data & Image Processing -----
 pillow>=10.0.0
-numpy>=1.24.0,<2.0.0
+numpy>=1.24.0
 pandas>=2.0.0
 pyarrow>=14.0.0       # Parquet reading
 fastparquet>=2023.10  # Alternative parquet engine
