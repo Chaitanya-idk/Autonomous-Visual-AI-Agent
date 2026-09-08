@@ -129,29 +129,37 @@ class StreamingSAGEDataset(IterableDataset):
         if max_samples:
             hf_ds = hf_ds.take(max_samples)
 
-        self._hf_ds      = hf_ds
-        self.processor   = processor
-        self.is_training = is_training
-        self.image_col   = image_col
-        self.disease_col = disease_col
-        self.crop_col    = crop_col or None
+        self._hf_ds       = hf_ds
+        self.repo_id      = repo_id          # stored for label vocab scan
+        self.processor    = processor
+        self.is_training  = is_training
+        self.image_col    = image_col
+        self.disease_col  = disease_col
+        self.crop_col     = crop_col or None
         self.label_id_col = label_id_col or None
-        self.max_samples = max_samples
-        self.label2id    = label2id or {}
+        self.max_samples  = max_samples
+        self.label2id     = label2id or {}
 
     def _build_label2id_from_streaming(self, scan_samples: int = 5000):
-        """Scan first N samples to build label vocab (only needed once)."""
+        """
+        Iterate the first scan_samples rows to collect unique disease labels.
+        Uses the already-initialised streaming dataset — no extra load_dataset call.
+        """
         print(f"[StreamingDataset] Scanning {scan_samples} samples to build label vocab...")
-        labels = set()
         from datasets import load_dataset
-        scan_ds = load_dataset(
-            self._hf_ds.info.builder_name if hasattr(self._hf_ds, 'info') else "tirtho149/SAGE",
-            split="train", streaming=True
-        ).take(scan_samples)
-        for row in scan_ds:
-            labels.add(str(row[self.disease_col]).strip())
+        # Re-create a fresh scan stream using the stored repo_id (not builder_name)
+        scan_stream = load_dataset(
+            self.repo_id, split="train", streaming=True
+        ).shuffle(seed=42, buffer_size=1000).take(scan_samples)
+
+        labels = set()
+        for row in scan_stream:
+            lbl = row.get(self.disease_col)
+            if lbl is not None:
+                labels.add(str(lbl).strip())
+
         self.label2id = {l: i for i, l in enumerate(sorted(labels))}
-        print(f"[StreamingDataset] Found {len(self.label2id)} unique disease labels.")
+        print(f"[StreamingDataset] Found {len(self.label2id)} disease classes.")
         return self.label2id
 
     def __iter__(self):

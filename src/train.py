@@ -167,11 +167,12 @@ def train(cfg: Dict[str, Any]):
     with open(output_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)
 
-    # Processor
+    # Processor — use_fast=False avoids the Qwen2VL fast-processor breaking-change warning
     prep_cfg  = cfg.get("preprocessing", {})
     processor = AutoProcessor.from_pretrained(
         cfg["model"]["name_or_path"],
         local_files_only=cfg["model"].get("local_files_only", False),
+        use_fast=False,
     )
     if prep_cfg.get("min_pixels"):
         processor.image_processor.min_pixels = prep_cfg["min_pixels"]
