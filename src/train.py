@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor, get_linear_schedule_with_warmup
+import requests
 from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,35 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.utils import set_seed, compute_classification_metrics
 from src.dataset import StreamingSAGEDataset, SAGEDataset, sage_collate_fn
 from src.model import get_qwen_lora_model
+
+
+# ── Shard downloader with direct HTTP streaming (no hidden cache) ─────────────
+
+def download_shard(repo_id: str, shard_idx: int, dest_dir: Path, token: Optional[str] = None) -> Path:
+    filename = f"train-{shard_idx:05d}.parquet"
+    dest_path = dest_dir / filename
+    if dest_path.exists() and dest_path.stat().st_size > 1000:
+        return dest_path
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = dest_dir / f"{filename}.tmp"
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/data/{filename}"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    response = requests.get(url, headers=headers, stream=True, timeout=120)
+    response.raise_for_status()
+    total_bytes = int(response.headers.get("content-length", 0))
+
+    with open(temp_path, "wb") as f, tqdm(
+        total=total_bytes, unit="B", unit_scale=True, desc=f"  Download shard {shard_idx:02d}", leave=False
+    ) as pbar:
+        for chunk in response.iter_content(chunk_size=2 * 1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                pbar.update(len(chunk))
+
+    temp_path.rename(dest_path)
+    return dest_path
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -191,27 +221,80 @@ def train(cfg: Dict[str, Any]):
     if prep_cfg.get("max_pixels"):
         processor.image_processor.max_pixels = prep_cfg["max_pixels"]
 
-    # Datasets
-    train_ds, val_ds, label2id = build_datasets(cfg, processor)
-
-    # Save label vocab
-    labels_path = Path(cfg["paths"].get("labels_json", "data/labels.json"))
-    labels_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(labels_path, "w") as f:
-        json.dump({"label2id": label2id,
-                   "id2label": {v: k for k, v in label2id.items()}}, f, indent=2)
-    print(f"[Train] {len(label2id)} disease classes. Labels saved → {labels_path}")
-
+    # Datasets setup
+    ds_cfg = cfg["dataset"]
+    ds_mode = ds_cfg.get("mode", "chunked" if ds_cfg.get("chunked", False) else ("streaming" if ds_cfg.get("streaming", False) else "local"))
+    is_chunked = (ds_mode == "chunked")
+    is_streaming = (ds_mode == "streaming")
     batch_size = train_cfg.get("batch_size", 2)
-    # Note: streaming IterableDataset needs shuffle=False (shuffled inside HF)
-    is_streaming = cfg["dataset"].get("streaming", False)
-    train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              shuffle=(not is_streaming),
-                              collate_fn=sage_collate_fn,
-                              num_workers=0,        # 0 required for IterableDataset
-                              pin_memory=True)
-    val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False,
-                              collate_fn=sage_collate_fn, num_workers=0)
+
+    common = dict(
+        processor=processor,
+        image_col=ds_cfg.get("image_col", "image"),
+        disease_col=ds_cfg.get("disease_col", "disease"),
+        crop_col=ds_cfg.get("crop_col", "crop"),
+        label_id_col=ds_cfg.get("label_id_col", ""),
+    )
+
+    labels_path = Path(cfg["paths"].get("labels_json", "data/labels.json"))
+
+    if is_chunked:
+        token = os.environ.get("HF_TOKEN", None)
+        repo_id = ds_cfg.get("hf_repo_id", "tirtho149/SAGE")
+        total_shards = ds_cfg.get("total_shards", 48)
+        chunk_size = ds_cfg.get("chunk_size", 2)
+        chunk_dir = Path(ds_cfg.get("chunk_dir", "/kaggle/working/data_cache"))
+        val_dir = chunk_dir / "val"
+        train_dir = chunk_dir / "train"
+        val_dir.mkdir(parents=True, exist_ok=True)
+        train_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Dedicated validation shard (shard 47, kept on disk ~430MB)
+        val_shard_idx = total_shards - 1
+        print(f"\n[Chunked Mode] Downloading fixed validation shard {val_shard_idx:02d}...")
+        download_shard(repo_id, val_shard_idx, val_dir, token=token)
+
+        if labels_path.exists():
+            with open(labels_path, "r") as f:
+                label2id = json.load(f)["label2id"]
+        else:
+            temp_ds = SAGEDataset(parquet_dir=str(val_dir), processor=processor, is_training=False, **common)
+            label2id = temp_ds.label2id
+            labels_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(labels_path, "w") as f:
+                json.dump({"label2id": label2id, "id2label": {v: k for k, v in label2id.items()}}, f, indent=2)
+
+        val_ds = SAGEDataset(parquet_dir=str(val_dir), processor=processor, is_training=False, label2id=label2id, **common)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=sage_collate_fn, num_workers=0)
+        print(f"[Chunked Mode] {len(label2id)} disease classes. Validation ready on shard {val_shard_idx:02d}.")
+
+        # 2. Training shards: 0 to val_shard_idx - 1 (e.g. 0 to 46)
+        train_shards = list(range(val_shard_idx))
+        chunks = [train_shards[i:i + chunk_size] for i in range(0, len(train_shards), chunk_size)]
+        max_chunks = ds_cfg.get("max_chunks_per_epoch")
+        if max_chunks:
+            chunks = chunks[:max_chunks]
+
+        # Estimated steps
+        steps_per_epoch = len(chunks) * (chunk_size * 2500 // batch_size)
+    else:
+        train_ds, val_ds, label2id = build_datasets(cfg, processor)
+        labels_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(labels_path, "w") as f:
+            json.dump({"label2id": label2id, "id2label": {v: k for k, v in label2id.items()}}, f, indent=2)
+        print(f"[Train] {len(label2id)} disease classes. Labels saved → {labels_path}")
+
+        train_loader = DataLoader(train_ds, batch_size=batch_size,
+                                  shuffle=(not is_streaming),
+                                  collate_fn=sage_collate_fn,
+                                  num_workers=0,
+                                  pin_memory=True)
+        val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False,
+                                  collate_fn=sage_collate_fn, num_workers=0)
+        if is_streaming:
+            steps_per_epoch = cfg["dataset"].get("train_size", 3200) // batch_size
+        else:
+            steps_per_epoch = len(train_loader)
 
     # Model
     lora_cfg = cfg["lora"]
@@ -233,11 +316,6 @@ def train(cfg: Dict[str, Any]):
     patience    = train_cfg.get("early_stopping_patience", 7)
     lr          = float(train_cfg.get("learning_rate", 1e-4))
 
-    # Estimate steps (for streaming: use train_size / batch_size)
-    if is_streaming:
-        steps_per_epoch = ds_cfg_steps = cfg["dataset"].get("train_size", 50000) // batch_size
-    else:
-        steps_per_epoch = len(train_loader)
     total_steps  = (steps_per_epoch // grad_accum) * num_epochs
     warmup_steps = int(total_steps * train_cfg.get("warmup_ratio", 0.05))
 
@@ -252,7 +330,7 @@ def train(cfg: Dict[str, Any]):
 
     print(f"\n{'='*60}")
     print(f"STARTING TRAINING | epochs={num_epochs} | patience={patience} | batch={batch_size}")
-    print(f"Mode: {'STREAMING' if is_streaming else 'LOCAL PARQUET'}")
+    print(f"Mode: {ds_mode.upper()} {'(Auto-flush rolling window)' if is_chunked else ''}")
     print(f"{'='*60}\n")
 
     best_f1    = -1.0
@@ -266,62 +344,126 @@ def train(cfg: Dict[str, Any]):
         step       = 0
         t0         = time.time()
         optimizer.zero_grad()
-        pbar = tqdm(
-            train_loader,
-            total=steps_per_epoch,
-            desc=f"Epoch {epoch}/{num_epochs}",
-            unit="step",
-            dynamic_ncols=True,
-            leave=True,
-        )
 
-        for batch in pbar:
-            ids  = batch["input_ids"].to(device)
-            attn = batch["attention_mask"].to(device)
-            pv   = batch["pixel_values"].to(device, dtype=dtype)
-            thw  = batch["image_grid_thw"].to(device)
-            lbl  = batch["labels"].to(device)
+        if is_chunked:
+            # ── ROLLING CHUNK LOOP: Download 2 shards → Train → Delete shards ──
+            for chunk_idx, shard_group in enumerate(chunks, 1):
+                print(f"\n>>> [Epoch {epoch}/{num_epochs}] Downloading Chunk {chunk_idx}/{len(chunks)} (Shards: {shard_group}) <<<", flush=True)
+                for s_idx in shard_group:
+                    download_shard(repo_id, s_idx, train_dir, token=token)
 
-            with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                out  = model(input_ids=ids, attention_mask=attn,
-                             pixel_values=pv, image_grid_thw=thw, labels=lbl)
-                loss = out.loss / grad_accum
+                chunk_ds = SAGEDataset(parquet_dir=str(train_dir), processor=processor, is_training=True, label2id=label2id, **common)
+                chunk_loader = DataLoader(chunk_ds, batch_size=batch_size, shuffle=True, collate_fn=sage_collate_fn, num_workers=2, pin_memory=True)
 
-            loss.backward()
-            step       += 1
-            epoch_loss += loss.item() * grad_accum
-
-            if step % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    train_cfg.get("max_grad_norm", 1.0)
+                pbar = tqdm(
+                    chunk_loader,
+                    desc=f"Ep {epoch} Ch {chunk_idx}/{len(chunks)}",
+                    unit="step",
+                    dynamic_ncols=True,
+                    leave=True,
                 )
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
 
-            # Dynamic speed & progress metrics
-            elapsed_sec   = time.time() - t0
-            items_per_sec = (step * batch_size) / max(elapsed_sec, 0.001)
-            postfix = {
-                "loss": f"{epoch_loss / step:.4f}",
-                "items/s": f"{items_per_sec:.1f}",
-                "lr": f"{scheduler.get_last_lr()[0]:.1e}",
-            }
-            if torch.cuda.is_available():
-                postfix["vram"] = f"{torch.cuda.memory_allocated() / (1024**3):.1f}GB"
+                for batch in pbar:
+                    ids  = batch["input_ids"].to(device)
+                    attn = batch["attention_mask"].to(device)
+                    pv   = batch["pixel_values"].to(device, dtype=dtype)
+                    thw  = batch["image_grid_thw"].to(device)
+                    lbl  = batch["labels"].to(device)
 
-            pbar.set_postfix(postfix)
+                    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                        out  = model(input_ids=ids, attention_mask=attn,
+                                     pixel_values=pv, image_grid_thw=thw, labels=lbl)
+                        loss = out.loss / grad_accum
 
-            # Cap streaming epoch to steps_per_epoch
-            if is_streaming and step >= steps_per_epoch:
-                break
+                    loss.backward()
+                    step       += 1
+                    epoch_loss += loss.item() * grad_accum
+
+                    if step % grad_accum == 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in model.parameters() if p.requires_grad],
+                            train_cfg.get("max_grad_norm", 1.0)
+                        )
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+
+                    elapsed_sec   = time.time() - t0
+                    items_per_sec = (step * batch_size) / max(elapsed_sec, 0.001)
+                    postfix = {
+                        "loss": f"{epoch_loss / max(step, 1):.4f}",
+                        "items/s": f"{items_per_sec:.1f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.1e}",
+                    }
+                    if torch.cuda.is_available():
+                        postfix["vram"] = f"{torch.cuda.memory_allocated() / (1024**3):.1f}GB"
+                    pbar.set_postfix(postfix)
+
+                # FLUSH: Delete chunk files from disk immediately to keep disk < 1.3 GB
+                for s_idx in shard_group:
+                    p_file = train_dir / f"train-{s_idx:05d}.parquet"
+                    if p_file.exists():
+                        try:
+                            p_file.unlink()
+                        except Exception:
+                            pass
+                print(f"[Disk Cleared] Flushed shards {shard_group}. Disk usage stays < 1.3 GB.", flush=True)
+
+        else:
+            pbar = tqdm(
+                train_loader,
+                total=steps_per_epoch,
+                desc=f"Epoch {epoch}/{num_epochs}",
+                unit="step",
+                dynamic_ncols=True,
+                leave=True,
+            )
+
+            for batch in pbar:
+                ids  = batch["input_ids"].to(device)
+                attn = batch["attention_mask"].to(device)
+                pv   = batch["pixel_values"].to(device, dtype=dtype)
+                thw  = batch["image_grid_thw"].to(device)
+                lbl  = batch["labels"].to(device)
+
+                with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                    out  = model(input_ids=ids, attention_mask=attn,
+                                 pixel_values=pv, image_grid_thw=thw, labels=lbl)
+                    loss = out.loss / grad_accum
+
+                loss.backward()
+                step       += 1
+                epoch_loss += loss.item() * grad_accum
+
+                if step % grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        train_cfg.get("max_grad_norm", 1.0)
+                    )
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                elapsed_sec   = time.time() - t0
+                items_per_sec = (step * batch_size) / max(elapsed_sec, 0.001)
+                postfix = {
+                    "loss": f"{epoch_loss / max(step, 1):.4f}",
+                    "items/s": f"{items_per_sec:.1f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.1e}",
+                }
+                if torch.cuda.is_available():
+                    postfix["vram"] = f"{torch.cuda.memory_allocated() / (1024**3):.1f}GB"
+
+                pbar.set_postfix(postfix)
+
+                if is_streaming and step >= steps_per_epoch:
+                    break
 
         elapsed = time.time() - t0
         avg_loss = epoch_loss / max(step, 1)
         total_items = step * batch_size
         overall_throughput = total_items / max(elapsed, 0.001)
-        print(f"\n[Epoch {epoch} Done] {step}/{steps_per_epoch} steps | "
+        print(f"\n[Epoch {epoch} Done] {step} steps | "
               f"{total_items} items in {elapsed:.1f}s ({overall_throughput:.1f} items/s) | "
               f"avg_loss={avg_loss:.4f}")
 
