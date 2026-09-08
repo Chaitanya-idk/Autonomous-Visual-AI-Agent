@@ -114,3 +114,12 @@ paths:
   log_dir: "logs"
   # Optional: labels vocab JSON (auto-generated from data if not present)
   labels_json: "data/labels.json"
+
+model:
+  name_or_path: "/kaggle/input/qwen2-5-vl-3b-instruct"  # ← local path on Kaggle
+  local_files_only: true    # ← MUST be true when using local path
+  torch_dtype: "bfloat16"
+
+dataset:
+  use_hf_hub: false
+  parquet_dir: "/kaggle/input/sage/data"   # ← your SAGE parquet path
