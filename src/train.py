@@ -1,12 +1,11 @@
 """
 Training pipeline for SAGE crop disease LoRA fine-tuning.
-Loads from parquet files or HuggingFace Hub. Full precision (no quantization).
-Supports early stopping, batch_size > 1, and bfloat16 autocast.
+Supports HuggingFace Hub streaming (no 21GB download needed).
+Full precision bfloat16/float16 LoRA — no quantization.
 """
 
 import os
 import sys
-import gc
 import json
 import time
 import yaml
@@ -16,23 +15,23 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 import torch
-from torch.utils.data import DataLoader, random_split
-from transformers import get_linear_schedule_with_warmup
+from torch.utils.data import DataLoader
+from transformers import AutoProcessor, get_linear_schedule_with_warmup
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils import set_seed, compute_classification_metrics
-from src.dataset import SAGEDataset, sage_collate_fn
-from src.model import get_qwen_lora_model, load_trained_lora_model
+from src.dataset import StreamingSAGEDataset, SAGEDataset, sage_collate_fn
+from src.model import get_qwen_lora_model
 
 
-# ── Config loading ────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     cfg_file = Path(config_path) if config_path else PROJECT_ROOT / "configs" / "config.yaml"
-    with open(cfg_file, "r", encoding="utf-8") as f:
+    with open(cfg_file, "r") as f:
         return yaml.safe_load(f)
 
 
@@ -42,9 +41,9 @@ def match_prediction(raw: str, label2id: Dict[str, int]):
     cleaned = raw.strip().strip('"\'').split("\n")[0].strip()
     if cleaned in label2id:
         return cleaned, label2id[cleaned], "valid"
-    lower = {k.lower(): k for k in label2id}
-    if cleaned.lower() in lower:
-        k = lower[cleaned.lower()]
+    lower_map = {k.lower(): k for k in label2id}
+    if cleaned.lower() in lower_map:
+        k = lower_map[cleaned.lower()]
         return k, label2id[k], "valid"
     return "Unknown", -1, "unknown"
 
@@ -53,73 +52,71 @@ def match_prediction(raw: str, label2id: Dict[str, int]):
 
 def build_datasets(cfg: Dict[str, Any], processor):
     ds_cfg = cfg["dataset"]
-    prep_cfg = cfg.get("preprocessing", {})
-
-    common_kwargs = dict(
+    common = dict(
         processor=processor,
         image_col=ds_cfg.get("image_col", "image"),
         disease_col=ds_cfg.get("disease_col", "disease"),
         crop_col=ds_cfg.get("crop_col", "crop"),
-        label_id_col=ds_cfg.get("label_id_col", "label_id"),
+        label_id_col=ds_cfg.get("label_id_col", ""),
     )
 
-    if ds_cfg.get("use_hf_hub", False):
-        from datasets import load_dataset
-        print(f"[Dataset] Loading from HuggingFace Hub: {ds_cfg['hf_repo_id']}")
-        hf = load_dataset(ds_cfg["hf_repo_id"])
-        train_hf = hf.get("train", hf[list(hf.keys())[0]])
-        val_hf   = hf.get("validation", None)
-        test_hf  = hf.get("test", None)
+    if ds_cfg.get("streaming", False):
+        # ── Streaming mode: reads from HuggingFace Hub live ──────────────────
+        print("[Train] Using STREAMING mode (tirtho149/SAGE via HF Hub)...")
 
-        full_ds = SAGEDataset(hf_dataset=train_hf, is_training=True, **common_kwargs)
-        label2id = full_ds.label2id
+        # First scan a small sample to build the label vocabulary
+        scan_ds = StreamingSAGEDataset(
+            repo_id=ds_cfg["hf_repo_id"], split="train",
+            max_samples=5000, is_training=False, **common
+        )
+        label2id = scan_ds._build_label2id_from_streaming(scan_samples=5000)
 
-        if val_hf:
-            val_ds  = SAGEDataset(hf_dataset=val_hf,  is_training=True,  label2id=label2id, **common_kwargs)
-            test_ds = SAGEDataset(hf_dataset=test_hf, is_training=False, label2id=label2id, **common_kwargs) if test_hf else None
-            train_ds = full_ds
-        else:
-            # Split locally
-            n = len(full_ds)
-            val_n  = int(n * ds_cfg.get("val_split", 0.15))
-            test_n = int(n * ds_cfg.get("test_split", 0.10))
-            train_n = n - val_n - test_n
-            train_ds, val_ds, test_ds = random_split(
-                full_ds, [train_n, val_n, test_n],
-                generator=torch.Generator().manual_seed(ds_cfg.get("seed", 42))
-            )
+        train_ds = StreamingSAGEDataset(
+            repo_id=ds_cfg["hf_repo_id"], split="train",
+            max_samples=ds_cfg.get("train_size", 50000),
+            is_training=True, label2id=label2id,
+            seed=ds_cfg.get("seed", 42), **common
+        )
+        val_ds = StreamingSAGEDataset(
+            repo_id=ds_cfg["hf_repo_id"], split="train",  # use a held-out portion
+            max_samples=ds_cfg.get("val_size", 5000),
+            is_training=True, label2id=label2id,
+            seed=ds_cfg.get("seed", 42) + 1, **common  # different seed → different shuffle
+        )
+        return train_ds, val_ds, label2id
+
     else:
+        # ── Local parquet mode ────────────────────────────────────────────────
         parquet_dir = ds_cfg.get("parquet_dir", "data/parquet")
         if not Path(parquet_dir).is_absolute():
             parquet_dir = str(PROJECT_ROOT / parquet_dir)
+        print(f"[Train] Loading local parquet from {parquet_dir}...")
 
-        full_ds = SAGEDataset(parquet_dir=parquet_dir, is_training=True, **common_kwargs)
+        from torch.utils.data import random_split
+        full_ds = SAGEDataset(parquet_dir=parquet_dir, is_training=True, **common)
         label2id = full_ds.label2id
-
         n = len(full_ds)
-        val_n  = int(n * ds_cfg.get("val_split", 0.15))
-        test_n = int(n * ds_cfg.get("test_split", 0.10))
-        train_n = n - val_n - test_n
-        train_ds, val_ds_raw, test_ds_raw = random_split(
-            full_ds, [train_n, val_n, test_n],
+        val_n   = int(n * ds_cfg.get("val_split", 0.15))
+        train_n = n - val_n
+        train_ds, val_ds = random_split(
+            full_ds, [train_n, val_n],
             generator=torch.Generator().manual_seed(ds_cfg.get("seed", 42))
         )
-        # Wrap subsets for eval (is_training=False for gen validation)
-        val_ds  = val_ds_raw
-        test_ds = test_ds_raw
-
-    return train_ds, val_ds, test_ds, label2id
+        return train_ds, val_ds, label2id
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-def validate(model, processor, val_loader, label2id, device, dtype):
+def validate(model, processor, val_loader, label2id, device, dtype, max_batches=200):
+    """Run validation — capped at max_batches for streaming mode."""
     model.eval()
     total_loss, count = 0.0, 0
     y_true, y_pred = [], []
 
     with torch.no_grad():
-        for batch in val_loader:
+        for i, batch in enumerate(val_loader):
+            if i >= max_batches:
+                break
             ids  = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
             pv   = batch["pixel_values"].to(device, dtype=dtype)
@@ -132,19 +129,17 @@ def validate(model, processor, val_loader, label2id, device, dtype):
             total_loss += out.loss.item()
             count += 1
 
-            # Generative prediction for F1
+            # Generate prediction
             gen_ids = model.generate(
                 input_ids=ids, attention_mask=attn,
                 pixel_values=pv, image_grid_thw=thw,
                 max_new_tokens=32, do_sample=False
             )
-            prompt_len = ids.shape[1]
             raw = processor.tokenizer.decode(
-                gen_ids[0, prompt_len:], skip_special_tokens=True
-            ).strip()
+                gen_ids[0, ids.shape[1]:], skip_special_tokens=True).strip()
             _, pred_id, _ = match_prediction(raw, label2id)
-            true_ids = batch["label_id"].tolist()
-            y_true.extend(true_ids)
+
+            y_true.extend(batch["label_id"].tolist())
             y_pred.append(pred_id)
 
     metrics = compute_classification_metrics(y_true, y_pred)
@@ -152,21 +147,20 @@ def validate(model, processor, val_loader, label2id, device, dtype):
     return metrics
 
 
-# ── Main training ─────────────────────────────────────────────────────────────
+# ── Training loop ─────────────────────────────────────────────────────────────
 
 def train(cfg: Dict[str, Any]):
     train_cfg = cfg["training"]
     set_seed(train_cfg.get("seed", 42))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_bf16 = train_cfg.get("bf16", True)
     dtype    = torch.bfloat16 if use_bf16 else torch.float16
 
-    # Directories
-    run_id = "001_sage_lora"
-    ckpt_dir   = PROJECT_ROOT / cfg["paths"]["checkpoint_dir"] / run_id
-    output_dir = PROJECT_ROOT / cfg["paths"]["output_dir"]    / run_id
-    log_dir    = PROJECT_ROOT / cfg["paths"]["log_dir"]       / run_id
+    # Output directories
+    ckpt_dir   = Path(cfg["paths"]["checkpoint_dir"])
+    output_dir = Path(cfg["paths"]["output_dir"])
+    log_dir    = Path(cfg["paths"]["log_dir"])
     for d in [ckpt_dir, output_dir, log_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -174,34 +168,37 @@ def train(cfg: Dict[str, Any]):
         json.dump(cfg, f, indent=2)
 
     # Processor
-    from transformers import AutoProcessor
-    prep_cfg = cfg.get("preprocessing", {})
+    prep_cfg  = cfg.get("preprocessing", {})
     processor = AutoProcessor.from_pretrained(
         cfg["model"]["name_or_path"],
         local_files_only=cfg["model"].get("local_files_only", False),
     )
-    min_px = prep_cfg.get("min_pixels")
-    max_px = prep_cfg.get("max_pixels")
-    if min_px:
-        processor.image_processor.min_pixels = min_px
-    if max_px:
-        processor.image_processor.max_pixels = max_px
+    if prep_cfg.get("min_pixels"):
+        processor.image_processor.min_pixels = prep_cfg["min_pixels"]
+    if prep_cfg.get("max_pixels"):
+        processor.image_processor.max_pixels = prep_cfg["max_pixels"]
 
-    # Data
-    train_ds, val_ds, test_ds, label2id = build_datasets(cfg, processor)
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)} samples")
+    # Datasets
+    train_ds, val_ds, label2id = build_datasets(cfg, processor)
 
     # Save label vocab
-    labels_path = PROJECT_ROOT / cfg["paths"].get("labels_json", "data/labels.json")
+    labels_path = Path(cfg["paths"].get("labels_json", "data/labels.json"))
     labels_path.parent.mkdir(parents=True, exist_ok=True)
     with open(labels_path, "w") as f:
-        json.dump({"label2id": label2id, "id2label": {v: k for k, v in label2id.items()}}, f, indent=2)
+        json.dump({"label2id": label2id,
+                   "id2label": {v: k for k, v in label2id.items()}}, f, indent=2)
+    print(f"[Train] {len(label2id)} disease classes. Labels saved → {labels_path}")
 
-    batch_size = train_cfg.get("batch_size", 4)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              collate_fn=sage_collate_fn, num_workers=2, pin_memory=True)
+    batch_size = train_cfg.get("batch_size", 2)
+    # Note: streaming IterableDataset needs shuffle=False (shuffled inside HF)
+    is_streaming = cfg["dataset"].get("streaming", False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=(not is_streaming),
+                              collate_fn=sage_collate_fn,
+                              num_workers=0,        # 0 required for IterableDataset
+                              pin_memory=True)
     val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False,
-                              collate_fn=sage_collate_fn, num_workers=1)
+                              collate_fn=sage_collate_fn, num_workers=0)
 
     # Model
     lora_cfg = cfg["lora"]
@@ -217,12 +214,18 @@ def train(cfg: Dict[str, Any]):
         is_trainable=True,
     )
 
-    # Optimizer & scheduler
-    grad_accum   = train_cfg.get("gradient_accumulation_steps", 8)
-    num_epochs   = train_cfg.get("num_epochs", 10)
-    patience     = train_cfg.get("early_stopping_patience", 7)
-    lr           = float(train_cfg.get("learning_rate", 1e-4))
-    total_steps  = (len(train_loader) // grad_accum) * num_epochs
+    # Optimizer + scheduler
+    grad_accum  = train_cfg.get("gradient_accumulation_steps", 16)
+    num_epochs  = train_cfg.get("num_epochs", 10)
+    patience    = train_cfg.get("early_stopping_patience", 7)
+    lr          = float(train_cfg.get("learning_rate", 1e-4))
+
+    # Estimate steps (for streaming: use train_size / batch_size)
+    if is_streaming:
+        steps_per_epoch = ds_cfg_steps = cfg["dataset"].get("train_size", 50000) // batch_size
+    else:
+        steps_per_epoch = len(train_loader)
+    total_steps  = (steps_per_epoch // grad_accum) * num_epochs
     warmup_steps = int(total_steps * train_cfg.get("warmup_ratio", 0.05))
 
     optimizer = torch.optim.AdamW(
@@ -234,20 +237,24 @@ def train(cfg: Dict[str, Any]):
         num_training_steps=max(1, total_steps)
     )
 
-    print(f"\n{'='*60}\nSTARTING TRAINING — {num_epochs} epochs | patience={patience} | batch={batch_size}\n{'='*60}")
+    print(f"\n{'='*60}")
+    print(f"STARTING TRAINING | epochs={num_epochs} | patience={patience} | batch={batch_size}")
+    print(f"Mode: {'STREAMING' if is_streaming else 'LOCAL PARQUET'}")
+    print(f"{'='*60}\n")
 
-    best_f1     = -1.0
-    best_epoch  = -1
-    no_improve  = 0
-    logs        = []
+    best_f1    = -1.0
+    best_epoch = -1
+    no_improve = 0
+    logs       = []
 
     for epoch in range(1, num_epochs + 1):
         model.train()
         epoch_loss = 0.0
-        t0 = time.time()
+        step       = 0
+        t0         = time.time()
         optimizer.zero_grad()
 
-        for step, batch in enumerate(train_loader, 1):
+        for batch in train_loader:
             ids  = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
             pv   = batch["pixel_values"].to(device, dtype=dtype)
@@ -260,9 +267,10 @@ def train(cfg: Dict[str, Any]):
                 loss = out.loss / grad_accum
 
             loss.backward()
+            step       += 1
             epoch_loss += loss.item() * grad_accum
 
-            if step % grad_accum == 0 or step == len(train_loader):
+            if step % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     train_cfg.get("max_grad_norm", 1.0)
@@ -273,47 +281,48 @@ def train(cfg: Dict[str, Any]):
 
                 opt_step = step // grad_accum
                 if opt_step % 20 == 0:
-                    print(f"  Epoch {epoch} | Step {step}/{len(train_loader)} | "
-                          f"Loss: {epoch_loss/step:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+                    print(f"  Ep {epoch} | step {step} | "
+                          f"loss {epoch_loss/step:.4f} | lr {scheduler.get_last_lr()[0]:.2e}",
+                          flush=True)
 
-        avg_train_loss = epoch_loss / len(train_loader)
         elapsed = time.time() - t0
-        print(f"\nEpoch {epoch} done in {elapsed:.0f}s. Avg train loss: {avg_train_loss:.4f}")
+        avg_loss = epoch_loss / max(step, 1)
+        print(f"\nEpoch {epoch} done in {elapsed:.0f}s | avg_loss={avg_loss:.4f}")
 
-        # Validation
-        val_metrics = validate(model, processor, val_loader, label2id, device, dtype)
+        # Validation (cap at 200 batches for streaming)
+        val_metrics = validate(model, processor, val_loader, label2id,
+                               device, dtype, max_batches=200)
         macro_f1 = val_metrics["macro_f1"]
-        print(f"[VAL] loss={val_metrics['val_loss']:.4f} | acc={val_metrics['accuracy']:.4f} | macro_f1={macro_f1:.4f}")
+        print(f"[VAL] loss={val_metrics['val_loss']:.4f} | "
+              f"acc={val_metrics['accuracy']:.4f} | macro_f1={macro_f1:.4f}")
 
-        log = {"epoch": epoch, "train_loss": avg_train_loss,
-               "time_sec": elapsed, **val_metrics}
-        logs.append(log)
+        logs.append({"epoch": epoch, "train_loss": avg_loss, "time_sec": elapsed, **val_metrics})
         pd.DataFrame(logs).to_csv(log_dir / "training_log.csv", index=False)
 
-        # Best checkpoint
+        # Checkpoint
         if macro_f1 > best_f1:
             best_f1    = macro_f1
             best_epoch = epoch
             no_improve = 0
-            ckpt_path = str(ckpt_dir / "best_checkpoint")
-            model.save_pretrained(ckpt_path)
-            print(f"  [SAVED] Best checkpoint → {ckpt_path}")
+            best_ckpt  = str(ckpt_dir / "best_checkpoint")
+            model.save_pretrained(best_ckpt)
+            print(f"  [SAVED] Best → {best_ckpt}", flush=True)
         else:
             no_improve += 1
-            print(f"  [EarlyStopping] No improvement for {no_improve}/{patience} epochs.")
+            print(f"  [EarlyStopping] {no_improve}/{patience} epochs without improvement.")
             if no_improve >= patience:
-                print(f"  [EarlyStopping] Stopping at epoch {epoch}.")
+                print(f"  Stopping early at epoch {epoch}.")
                 break
 
-        # Per-epoch checkpoint
         model.save_pretrained(str(ckpt_dir / f"epoch_{epoch}"))
 
-    # Final summary
+    # Summary
+    summary = {"best_epoch": best_epoch, "best_val_macro_f1": best_f1,
+               "checkpoint": str(ckpt_dir / "best_checkpoint")}
     with open(output_dir / "run_summary.json", "w") as f:
-        json.dump({"best_epoch": best_epoch, "best_val_macro_f1": best_f1,
-                   "checkpoint": str(ckpt_dir / "best_checkpoint")}, f, indent=2)
+        json.dump(summary, f, indent=2)
 
-    print(f"\n{'='*60}\nTRAINING COMPLETE\nBest Epoch: {best_epoch} | Best Val Macro F1: {best_f1:.4f}\n{'='*60}")
+    print(f"\n{'='*60}\nDONE | Best Epoch: {best_epoch} | Best Macro F1: {best_f1:.4f}\n{'='*60}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -322,5 +331,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
     args = parser.parse_args()
-    cfg = load_config(args.config)
-    train(cfg)
+    train(load_config(args.config))

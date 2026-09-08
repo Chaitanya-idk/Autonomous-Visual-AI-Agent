@@ -1,26 +1,29 @@
 # ============================================================
 # SAGE Crop Disease — LoRA Fine-Tuning Configuration
 # Model: Qwen2.5-VL-3B-Instruct (full precision, no quantization)
-# Target: GCP Compute Engine / Vertex AI / Kaggle (T4/L4/A100)
+# Target: Kaggle (T4/P100/A100) | GCP (L4/A100)
 # ============================================================
 
+# ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  # HuggingFace model name — downloaded automatically on first run
-  name_or_path: "Qwen/Qwen2.5-VL-3B-Instruct"
-  # Set to true for air-gapped environments; false for Kaggle/GCP with internet
-  local_files_only: false
-  # Use bfloat16 for better numerical stability on modern GPUs (A100, L4)
-  # Use float16 if on T4 / P100 (older GPUs that don't natively support bf16)
+  # Option A: Kaggle model hub (add the model via Kaggle UI)
+  #   name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"
+  #   local_files_only: true
+  #
+  # Option B: HuggingFace Hub (needs internet ON in Kaggle settings)
+  #   name_or_path: "Qwen/Qwen2.5-VL-3B-Instruct"
+  #   local_files_only: false
+  name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"
+  local_files_only: true
+  # bfloat16: A100/L4/H100 (best quality)
+  # float16:  T4/P100 (older GPUs, use this if bf16 throws errors)
   torch_dtype: "bfloat16"
 
-# ── LoRA Adapter Configuration ────────────────────────────────────────────────
+# ── LoRA Adapter ──────────────────────────────────────────────────────────────
 lora:
-  # Rank — higher = more capacity but more memory (16–64 typical)
-  r: 32
-  # Alpha scaling factor (usually 2x rank)
-  lora_alpha: 64
+  r: 32             # Rank (16–64); higher = more capacity + more VRAM
+  lora_alpha: 64    # Usually 2x rank
   lora_dropout: 0.05
-  # Modules to apply LoRA to (vision + language attention projections)
   target_modules:
     - "q_proj"
     - "k_proj"
@@ -29,97 +32,71 @@ lora:
   bias: "none"
   task_type: "CAUSAL_LM"
 
-# ── Dataset Configuration ─────────────────────────────────────────────────────
+# ── Dataset ───────────────────────────────────────────────────────────────────
 dataset:
-  # HuggingFace dataset repo ID (used when use_hf_hub: true)
-  hf_repo_id: "tirtho149/SAGE"
+  hf_repo_id: "tirtho149/SAGE"   # HuggingFace dataset ID
 
-  # Set to true to stream/download from HuggingFace Hub (needs internet)
-  # Set to false to load from local parquet files (parquet_dir below)
-  use_hf_hub: false
+  # STREAMING MODE (recommended for 21GB dataset — zero download wait)
+  # Reads data directly from HuggingFace Hub over the network.
+  # Requires: Internet ON in Kaggle settings.
+  streaming: true
 
-  # Path to folder containing .parquet files when use_hf_hub is false
-  # Kaggle example: "/kaggle/input/sage/data"
-  # GCP example:    "/home/user/sage-data/data"
-  parquet_dir: "data/parquet"
+  # ── Column names — verify with: df.columns.tolist() on one parquet file ──
+  image_col: "image"       # PIL image or {"bytes": b"..."} dict
+  disease_col: "disease"   # Disease name string (target label)
+  crop_col: "crop"         # Crop type (set "" to disable)
+  label_id_col: ""         # Integer label id (set "" if not in dataset)
 
-  # --- Column names in your parquet/HF dataset ---
-  # Run: df.columns.tolist() on a sample row to verify these
-  image_col: "image"       # Column holding image (PIL or {"bytes":...} dict)
-  disease_col: "disease"   # Target label column (the disease name string)
-  crop_col: "crop"         # Optional crop type column (set to "" to disable)
-  label_id_col: "label_id" # Integer label index column (set to "" if absent)
-
-  # Canonical label mapping JSON (optional, from tirtho149/SAGE repo)
-  # Set to "" to disable; labels inferred from data instead
-  canonical_mapping: ""    # e.g. "canonical_mapping.json"
-
-  # Train / val / test split ratios (only used when splitting locally)
-  val_split: 0.15
-  test_split: 0.10
+  # ── Streaming split sizes (number of samples, not ratios) ─────────────────
+  # Total SAGE dataset has ~100K-1M images; adjust to your GPU time budget.
+  # Kaggle free tier: ~9 hours — aim for ~50K–100K training samples.
+  train_size: 50000   # Number of streaming samples used for training per epoch
+  val_size: 5000      # Number of streaming samples used for validation
   seed: 42
 
 # ── Preprocessing / Vision Resolution ────────────────────────────────────────
 preprocessing:
-  # Visual token budget per image (28×28 = 784 pixels per patch)
-  # Higher = more detail but more VRAM.
-  # Examples:
-  #   min=100352 / max=200704  →  128–256 visual tokens  (T4 16GB, safe)
-  #   min=200704 / max=401408  →  256–512 visual tokens  (L4 24GB / A100)
-  #   min=401408 / max=802816  →  512–1024 visual tokens (A100 80GB)
-  # Set both to null to use the model's default (full resolution, most VRAM)
-  min_pixels: 200704   # 256 visual tokens
-  max_pixels: 401408   # 512 visual tokens
+  # Higher = more image detail but more VRAM.
+  # T4 (16GB):   min=100352 / max=200704  (128–256 tokens, safe)
+  # L4 (24GB):   min=200704 / max=401408  (256–512 tokens)
+  # A100 (40GB): min=401408 / max=802816  (512–1024 tokens)
+  min_pixels: 100352
+  max_pixels: 200704
 
-# ── Training Hyperparameters ─────────────────────────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 training:
   seed: 42
 
-  # Per-GPU batch size.
-  # T4 16GB  → 2–4 with LoRA + 256-512 visual tokens
-  # L4 24GB  → 4–8
-  # A100 40GB → 8–16
-  batch_size: 4
+  # T4 16GB → batch 2–4 | L4 24GB → batch 4–8 | A100 → batch 8–16
+  batch_size: 2
 
-  # Effective batch = batch_size * gradient_accumulation_steps
-  # Keep effective batch ≥ 32 for stable VLM fine-tuning
-  gradient_accumulation_steps: 8
+  # Effective batch = batch_size × gradient_accumulation_steps (aim for ≥32)
+  gradient_accumulation_steps: 16
 
   learning_rate: 0.0001
   weight_decay: 0.01
   warmup_ratio: 0.05
   num_epochs: 10
-
-  # Stop training if val macro-F1 does not improve for this many epochs
   early_stopping_patience: 7
 
   gradient_checkpointing: true
-  fp16: false      # Use with float16 dtype (older GPUs)
-  bf16: true       # Use with bfloat16 dtype (A100, L4, etc.)
+  fp16: false   # true for T4/P100 (float16)
+  bf16: true    # true for A100/L4 (bfloat16); set false if using fp16
   max_grad_norm: 1.0
-  eval_batch_size: 1
 
-  # Save adapter-only or merged full model
-  # "adapter" = small (~50–200MB), requires PEFT at inference
-  # "merged"  = full model (~7GB), self-contained for deployment
+  # "adapter" = small ~50MB, needs PEFT at inference
+  # "merged"  = full 7GB model, self-contained
   save_mode: "adapter"
 
 # ── Output Paths ─────────────────────────────────────────────────────────────
 paths:
-  # Folder to save LoRA adapters / merged weights
-  checkpoint_dir: "checkpoints"
-  # Folder for evaluation outputs, metrics, figures
-  output_dir: "outputs"
-  # Training logs (CSV per epoch)
-  log_dir: "logs"
-  # Optional: labels vocab JSON (auto-generated from data if not present)
-  labels_json: "data/labels.json"
-
-model:
-  name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"  # ← local path on Kaggle
-  local_files_only: true    # ← MUST be true when using local path
-  torch_dtype: "bfloat16"
-
-dataset:
-  use_hf_hub: false
-  parquet_dir: "/kaggle/input/sage/data"   # ← your SAGE parquet path
+  # On Kaggle: use /kaggle/working/ so outputs are saved as notebook artifacts
+  checkpoint_dir: "/kaggle/working/checkpoints"
+  output_dir:     "/kaggle/working/outputs"
+  log_dir:        "/kaggle/working/logs"
+  labels_json:    "/kaggle/working/labels.json"
+  # On GCP / local: use relative paths
+  # checkpoint_dir: "checkpoints"
+  # output_dir:     "outputs"
+  # log_dir:        "logs"
+  # labels_json:    "data/labels.json"
