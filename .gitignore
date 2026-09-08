@@ -2,7 +2,7 @@
 # SAGE QLoRA Project — .gitignore
 # ============================================================
 
-# ----- Python -----------------------------------------------
+# ----- Python & Caching --------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -15,8 +15,10 @@ build/
 .installed.cfg
 MANIFEST
 pip-wheel-metadata/
+.pytest_cache/
+.coverage
 
-# ----- Virtual envs / conda ---------------------------------
+# ----- Virtual Environments & Conda -------------------------
 .env
 .venv
 env/
@@ -24,15 +26,15 @@ venv/
 ENV/
 *.conda
 
-# ----- Jupyter ----------------------------------------------
+# ----- Jupyter Notebooks -------------------------------------
 .ipynb_checkpoints/
 *.ipynb
 
-# ----- Dataset — large binary / generated files -------------
+# ----- Dataset & Large Data Directories ----------------------
 # Raw HuggingFace arrow dataset (original, read-only source)
 SAGE-sample/
 
-# Extracted images (regeneratable from SAGE-sample via src/extract_dataset.py)
+# Extracted images (regeneratable via src/extract_dataset.py)
 data/processed/images/
 
 # Generated CSVs and reports (regeneratable)
@@ -43,24 +45,42 @@ data/processed/test.csv
 data/processed/labels.json
 data/reports/
 
-# ----- Model artefacts / training outputs -------------------
+# ----- Model Artifacts, Weights & Training Outputs -----------
 checkpoints/
 outputs/
 logs/
+hf_cache/
+.cache/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
 
-# ----- OS ---------------------------------------------------
+# ----- GCP & Cloud Storage / Credentials ---------------------
+.gcloud/
+.gcp/
+*.json-key
+*credentials*.json
+*.gcloudignore
+
+# ----- Experiment Trackers & Logs ----------------------------
+wandb/
+runs/
+tensorboard/
+*.log
+
+# ----- OS & IDE Files ----------------------------------------
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ----- IDEs -------------------------------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
+.gemini/
 
-# ----- Misc -------------------------------------------------
-*.log
+# ----- Miscellaneous -----------------------------------------
 *.tmp
 *.bak
 *.orig
