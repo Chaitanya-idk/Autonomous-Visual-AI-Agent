@@ -19,22 +19,34 @@ env/
 venv/
 *.conda
 
-# ----- Dataset (large binary files — store in GCS/Kaggle) ---
-# Raw parquet files (download separately on Kaggle/GCP)
-data/parquet/
-# Old extraction pipeline artifacts (no longer needed)
+# ----- Dataset (NEVER commit — download on Kaggle/GCP) ------
 data/processed/
+data/parquet/
+data/labels.json
 SAGE-sample/
 
+# Keep directory structure via .gitkeep
+!data/.gitkeep
+
 # ----- Model Weights & Training Outputs ---------------------
-checkpoints/
-outputs/
-logs/
+# checkpoints/, outputs/, logs/ are gitignored — keep .gitkeep only
+checkpoints/*
+!checkpoints/.gitkeep
+outputs/*
+!outputs/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Also ignore any stray weight files
 *.pt
 *.pth
 *.bin
 *.safetensors
 *.onnx
+
+# ----- Pretrained model cache (downloaded locally) ----------
+models/
+hf_cache/
 
 # ----- GCP / Cloud Credentials ------------------------------
 .gcloud/
