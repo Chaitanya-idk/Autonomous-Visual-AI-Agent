@@ -1,9 +1,0 @@
-{
-  "source_path": "C:\\Projects\\Autonomous-visual-ai-Agent2\\dataset_loader\\SAGE-sample",
-  "total_records": 1848,
-  "successfully_extracted": 1848,
-  "failed_records_count": 0,
-  "failed_records": [],
-  "metadata_csv": "C:\\Projects\\Autonomous-visual-ai-Agent2\\dataset_loader\\data\\processed\\metadata.csv",
-  "images_directory": "C:\\Projects\\Autonomous-visual-ai-Agent2\\dataset_loader\\data\\processed\\images"
-}
