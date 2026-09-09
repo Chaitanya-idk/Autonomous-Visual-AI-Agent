@@ -55,8 +55,8 @@ dataset:
   seed: 42
 
 preprocessing:
-  min_pixels: 25088
-  max_pixels: 50176
+  min_pixels: 12544
+  max_pixels: 25088
 
 evaluation:
   # Fast per-epoch validation. Final evaluation can use the full shard.
@@ -66,6 +66,8 @@ training:
   seed: 42
   batch_size: 4
   gradient_accumulation_steps: 8
+  num_workers: 4
+
   learning_rate: 0.0001
   weight_decay: 0.01
   warmup_ratio: 0.05
