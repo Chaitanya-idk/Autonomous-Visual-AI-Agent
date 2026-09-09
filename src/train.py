@@ -32,6 +32,7 @@ from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 import requests
 import torch
+import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
@@ -181,6 +182,43 @@ def _autocast_context(dtype: torch.dtype):
     return nullcontext()
 
 
+def _compute_float32_causal_loss(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    """
+    Compute a numerically stable causal LM loss in float32.
+
+    Qwen's internal loss is normally a standard cross-entropy loss, but when
+    validation is run under FP16 autocast we do not want FP16 reduction
+    numerical behavior to produce a misleading value. The returned loss is
+    always computed from float32 logits and is therefore non-negative for
+    finite logits.
+    """
+    if logits.ndim != 3 or labels.ndim != 2:
+        raise ValueError(
+            f"Unexpected logits/labels shapes: logits={tuple(logits.shape)}, "
+            f"labels={tuple(labels.shape)}"
+        )
+
+    # Causal LM: token t predicts label t+1.
+    shift_logits = logits[:, :-1, :].float().contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+
+    valid_tokens = int((shift_labels != -100).sum().item())
+    if valid_tokens == 0:
+        raise ValueError("Validation batch contains no non-ignored target tokens.")
+
+    loss = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="mean",
+    )
+
+    if not torch.isfinite(loss):
+        raise ValueError(f"Non-finite validation loss encountered: {loss.item()}")
+
+    return loss, valid_tokens
+
+
 def validate(
     model,
     processor,
@@ -195,19 +233,32 @@ def validate(
     """
     Validate without leaking the answer into generation.
 
-    val_loss_loader contains teacher-forced samples with labels and is used
-    only for validation loss.
+    Two independent checks are performed:
 
-    val_gen_loader contains prompt-only samples and is used for model.generate()
-    and classification metrics.
+      1. Teacher-forced validation loss:
+         the answer is present in labels, but the prompt portion is masked.
+
+      2. Generation-based classification:
+         the answer is NOT present in the prompt. The generated text is
+         matched against the authoritative disease vocabulary.
+
+    Validation loss is computed manually in float32 from model logits. This
+    avoids misleading FP16 loss reductions and lets us independently verify
+    the model's reported loss.
+
+    The first few generated answers are printed and also returned in a small
+    diagnostics file by the caller so that label-matching failures are visible.
     """
     model.eval()
 
     total_loss = 0.0
     loss_count = 0
+    valid_token_count = 0
+    model_reported_loss_sum = 0.0
     y_true: List[int] = []
     y_pred: List[int] = []
     unknown_count = 0
+    debug_rows: List[Dict[str, Any]] = []
 
     loss_total = len(val_loss_loader)
     if max_batches is not None:
@@ -228,6 +279,7 @@ def validate(
         dynamic_ncols=True,
         leave=False,
     )
+
     with torch.no_grad():
         for i, batch in loss_pbar:
             if max_batches is not None and i >= max_batches:
@@ -248,11 +300,30 @@ def validate(
                     labels=labels,
                 )
 
-            total_loss += float(out.loss.detach().float().item())
+            float32_loss, valid_tokens = _compute_float32_causal_loss(
+                out.logits,
+                labels,
+            )
+
+            total_loss += float32_loss.item()
+            model_loss = float(out.loss.detach().float().item())
+            model_reported_loss_sum += model_loss
+            valid_token_count += valid_tokens
             loss_count += 1
-            loss_pbar.set_postfix(val_loss=f"{total_loss / max(loss_count, 1):.4f}")
+
+            loss_pbar.set_postfix(
+                val_loss=f"{total_loss / max(loss_count, 1):.4f}",
+                model_loss=f"{model_reported_loss_sum / max(loss_count, 1):.4f}",
+            )
 
     avg_val_loss = total_loss / max(loss_count, 1)
+    avg_model_loss = model_reported_loss_sum / max(loss_count, 1)
+
+    print(
+        f"  [Validation loss check] float32_ce={avg_val_loss:.6f} | "
+        f"model_reported_loss={avg_model_loss:.6f} | "
+        f"valid_target_tokens={valid_token_count}"
+    )
 
     # 2) Generation-based classification evaluation.
     gen_pbar = tqdm(
@@ -263,6 +334,7 @@ def validate(
         dynamic_ncols=True,
         leave=False,
     )
+
     with torch.no_grad():
         for i, batch in gen_pbar:
             if max_batches is not None and i >= max_batches:
@@ -274,14 +346,21 @@ def validate(
             thw = batch["image_grid_thw"].to(device, non_blocking=True)
 
             true_id = int(batch["label_id"][0].item())
+            true_label = str(batch["disease"][0])
 
+            # The prompt explicitly asks for only the disease name, so use
+            # deterministic generation. Explicitly clear sampling-only fields
+            # to avoid the transformers "invalid generation flags" warning.
             generated_ids = model.generate(
                 input_ids=ids,
                 attention_mask=attn,
                 pixel_values=pv,
                 image_grid_thw=thw,
-                max_new_tokens=32,
+                max_new_tokens=16,
                 do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
             )
 
             prompt_len = ids.shape[1]
@@ -291,19 +370,46 @@ def validate(
                 skip_special_tokens=True,
             ).strip()
 
-            _, pred_id, status = match_prediction_to_vocab(raw_text, label2id)
+            pred_label, pred_id, status = match_prediction_to_vocab(
+                raw_text,
+                label2id,
+            )
 
             if true_id >= 0:
                 y_true.append(true_id)
                 y_pred.append(pred_id)
+
             if status == "unknown":
                 unknown_count += 1
+
+            if len(debug_rows) < 10:
+                debug_rows.append(
+                    {
+                        "index": i,
+                        "true_label": true_label,
+                        "true_id": true_id,
+                        "raw_model_output": raw_text,
+                        "matched_label": pred_label,
+                        "predicted_id": pred_id,
+                        "status": status,
+                    }
+                )
+                print(
+                    f"    [VAL SAMPLE {i}] "
+                    f"true={true_label!r} | "
+                    f"raw={raw_text!r} | "
+                    f"pred={pred_label!r} | "
+                    f"status={status}"
+                )
 
             running_acc = (
                 sum(yt == yp for yt, yp in zip(y_true, y_pred)) / len(y_true)
                 if y_true else 0.0
             )
-            gen_pbar.set_postfix(acc=f"{running_acc:.2%}", unknown=unknown_count)
+            gen_pbar.set_postfix(
+                acc=f"{running_acc:.2%}",
+                unknown=unknown_count,
+            )
 
     metrics = compute_classification_metrics(
         y_true,
@@ -311,9 +417,12 @@ def validate(
         labels_list=list(label2id.values()),
     )
     metrics["val_loss"] = float(avg_val_loss)
+    metrics["model_reported_val_loss"] = float(avg_model_loss)
+    metrics["valid_target_tokens"] = int(valid_token_count)
     metrics["unknown_predictions"] = int(unknown_count)
     metrics["unknown_rate"] = float(unknown_count / max(len(y_true), 1))
     metrics["num_eval_samples"] = int(len(y_true))
+    metrics["validation_debug_samples"] = debug_rows
 
     return metrics
 
@@ -336,6 +445,59 @@ def save_checkpoint(
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
     with open(checkpoint_dir / "trainer_state.json", "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+
+def load_checkpoint_state(
+    model,
+    optimizer,
+    scheduler,
+    checkpoint_dir: Path,
+) -> Dict[str, Any]:
+    """Load LoRA adapter, optimizer, scheduler, and trainer state."""
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    state_path = checkpoint_dir / "trainer_state.json"
+    if not state_path.exists():
+        raise FileNotFoundError(f"Missing trainer_state.json in {checkpoint_dir}")
+
+    adapter_path = checkpoint_dir / "adapter_model.safetensors"
+    if adapter_path.exists():
+        from safetensors.torch import load_file
+        adapter_state = load_file(str(adapter_path), device="cpu")
+    else:
+        adapter_path = checkpoint_dir / "adapter_model.bin"
+        if not adapter_path.exists():
+            raise FileNotFoundError(
+                f"No adapter weights found in {checkpoint_dir} "
+                "(expected adapter_model.safetensors or adapter_model.bin)."
+            )
+        adapter_state = torch.load(str(adapter_path), map_location="cpu", weights_only=True)
+
+    try:
+        from peft import set_peft_model_state_dict
+        set_peft_model_state_dict(model, adapter_state)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not restore LoRA adapter weights from {checkpoint_dir}: {exc}"
+        ) from exc
+
+    optimizer_path = checkpoint_dir / "optimizer.pt"
+    scheduler_path = checkpoint_dir / "scheduler.pt"
+    if optimizer_path.exists():
+        optimizer.load_state_dict(torch.load(str(optimizer_path), map_location="cpu", weights_only=True))
+    else:
+        raise FileNotFoundError(f"Missing optimizer.pt in {checkpoint_dir}")
+
+    if scheduler_path.exists():
+        scheduler.load_state_dict(torch.load(str(scheduler_path), map_location="cpu", weights_only=True))
+    else:
+        raise FileNotFoundError(f"Missing scheduler.pt in {checkpoint_dir}")
+
+    with open(state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+
+    return state
 
 
 def optimizer_step(
@@ -462,10 +624,12 @@ def train(cfg: Dict[str, Any]) -> None:
     is_streaming = ds_mode == "streaming"
     batch_size = int(train_cfg.get("batch_size", 4))
     grad_accum = int(train_cfg.get("gradient_accumulation_steps", 8))
-    num_workers = int(train_cfg.get("num_workers", 2))
     num_epochs = int(train_cfg.get("num_epochs", 3))
     patience = int(train_cfg.get("early_stopping_patience", 2))
     lr = float(train_cfg.get("learning_rate", 1e-4))
+    num_workers = int(train_cfg.get("num_workers", 2))
+    resume_enabled = bool(train_cfg.get("resume", True))
+    resume_name = str(train_cfg.get("resume_checkpoint", "latest_checkpoint"))
 
     common = dict(
         image_col=ds_cfg.get("image_col", "image"),
@@ -530,7 +694,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=1,
             shuffle=False,
             collate_fn=sage_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=True,
         )
         val_gen_loader = DataLoader(
@@ -538,7 +702,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=1,
             shuffle=False,
             collate_fn=sage_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=True,
         )
         print(
@@ -586,7 +750,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=batch_size,
             shuffle=not is_streaming,
             collate_fn=sage_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=True,
         )
         val_loss_loader = DataLoader(
@@ -594,7 +758,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=1,
             shuffle=False,
             collate_fn=sage_collate_fn,
-            num_workers=num_workers,
+            num_workers=0,
         )
         val_gen_loader = val_loss_loader
         steps_per_epoch_estimate = (
@@ -646,13 +810,66 @@ def train(cfg: Dict[str, Any]) -> None:
         print("Base model load count: 1 (model persists across every chunk/epoch)")
     print("=" * 72 + "\n")
 
+    # ── Resume state ─────────────────────────────────────────────────────────
+    # By default, rerunning the script resumes from latest_checkpoint if it
+    # exists. This checkpoint is updated after every chunk and again after each
+    # completed epoch, so an interrupted Kaggle session can continue without
+    # throwing away completed work.
     best_f1 = -1.0
     best_epoch = -1
     no_improve = 0
     logs: List[Dict[str, Any]] = []
     global_step = 0
+    start_epoch = 1
+    resume_chunk_start = 1
 
-    for epoch in range(1, num_epochs + 1):
+    resume_dir = ckpt_dir / resume_name
+    if resume_enabled and resume_dir.exists() and (resume_dir / "trainer_state.json").exists():
+        print(f"\n[Resume] Found checkpoint: {resume_dir}")
+        resume_state = load_checkpoint_state(model, optimizer, scheduler, resume_dir)
+        saved_epoch = int(resume_state.get("epoch", 0))
+        saved_chunk = int(resume_state.get("completed_chunk", 0))
+        saved_total_chunks = int(resume_state.get("total_chunks", len(chunks) if is_chunked else 0))
+        global_step = int(resume_state.get("global_optimizer_step", 0))
+        best_f1 = float(resume_state.get("best_val_macro_f1", -1.0))
+        best_epoch = int(resume_state.get("best_epoch", -1))
+        no_improve = int(resume_state.get("no_improve", 0))
+
+        if is_chunked:
+            if saved_total_chunks != len(chunks):
+                raise RuntimeError(
+                    f"Checkpoint was created with {saved_total_chunks} chunks, "
+                    f"but the current configuration has {len(chunks)}. "
+                    "Use a fresh checkpoint directory or set training.resume=false."
+                )
+            if saved_chunk >= len(chunks):
+                start_epoch = saved_epoch + 1
+                resume_chunk_start = 1
+                print(
+                    f"[Resume] Epoch {saved_epoch} is complete. "
+                    f"Continuing from Epoch {start_epoch}."
+                )
+            else:
+                start_epoch = max(saved_epoch, 1)
+                resume_chunk_start = saved_chunk + 1
+                print(
+                    f"[Resume] Continuing Epoch {start_epoch} from chunk "
+                    f"{resume_chunk_start}/{len(chunks)}. "
+                    f"Completed chunks: {saved_chunk}."
+                )
+        else:
+            start_epoch = saved_epoch + 1
+
+    if start_epoch > num_epochs:
+        print(
+            f"[Resume] Checkpoint already reaches epoch {start_epoch - 1}, "
+            f"which meets/exceeds num_epochs={num_epochs}. Nothing to train."
+        )
+        return
+
+    print(f"[Resume] Start epoch={start_epoch} | start chunk={resume_chunk_start}")
+
+    for epoch in range(start_epoch, num_epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_batches = 0
@@ -667,6 +884,9 @@ def train(cfg: Dict[str, Any]) -> None:
             # Every chunk is trained by the SAME model object. Only the local
             # Parquet files are replaced.
             for chunk_idx, shard_group in enumerate(chunks, 1):
+                if epoch == start_epoch and chunk_idx < resume_chunk_start:
+                    continue
+
                 print(
                     f"\n>>> [Epoch {epoch}/{num_epochs}] "
                     f"Chunk {chunk_idx}/{len(chunks)} | Shards {shard_group} <<<",
@@ -787,6 +1007,9 @@ def train(cfg: Dict[str, Any]) -> None:
                         "total_chunks": len(chunks),
                         "completed_shards": shard_group,
                         "global_optimizer_step": global_step,
+                        "best_val_macro_f1": best_f1,
+                        "best_epoch": best_epoch,
+                        "no_improve": no_improve,
                     },
                 )
                 print("  [Checkpoint] Rolling-window progress saved.", flush=True)
@@ -886,6 +1109,13 @@ def train(cfg: Dict[str, Any]) -> None:
         logs.append(log_row)
         pd.DataFrame(logs).to_csv(log_dir / "training_log.csv", index=False)
 
+        # Keep the first validation generations visible on disk. This is
+        # especially useful when accuracy is low because it distinguishes
+        # genuine model errors from vocabulary-matching failures.
+        debug_samples = val_metrics.get("validation_debug_samples", [])
+        with open(log_dir / "validation_debug.json", "w", encoding="utf-8") as f:
+            json.dump(debug_samples, f, indent=2, ensure_ascii=False)
+
         # ── Best checkpoint ──────────────────────────────────────────────────
         if macro_f1 > best_f1:
             best_f1 = macro_f1
@@ -898,8 +1128,12 @@ def train(cfg: Dict[str, Any]) -> None:
                 ckpt_dir / "best_checkpoint",
                 {
                     "epoch": epoch,
+                    "completed_chunk": len(chunks) if is_chunked else 0,
+                    "total_chunks": len(chunks) if is_chunked else 0,
                     "global_optimizer_step": global_step,
                     "best_val_macro_f1": best_f1,
+                    "best_epoch": best_epoch,
+                    "no_improve": no_improve,
                 },
             )
             print(f"  [SAVED] Best checkpoint -> {ckpt_dir / 'best_checkpoint'}")
@@ -910,16 +1144,34 @@ def train(cfg: Dict[str, Any]) -> None:
                 print(f"  Stopping early at epoch {epoch}.")
                 break
 
+        epoch_state = {
+            "epoch": epoch,
+            "completed_chunk": len(chunks) if is_chunked else 0,
+            "total_chunks": len(chunks) if is_chunked else 0,
+            "global_optimizer_step": global_step,
+            "val_metrics": val_metrics,
+            "best_val_macro_f1": best_f1,
+            "best_epoch": best_epoch,
+            "no_improve": no_improve,
+        }
+
         save_checkpoint(
             model,
             optimizer,
             scheduler,
             ckpt_dir / f"epoch_{epoch}",
-            {
-                "epoch": epoch,
-                "global_optimizer_step": global_step,
-                "val_metrics": val_metrics,
-            },
+            epoch_state,
+        )
+
+        # Mark the whole epoch as complete in latest_checkpoint. This is what
+        # makes a normal restart after validation continue at epoch+1 instead
+        # of replaying the final epoch.
+        save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            ckpt_dir / "latest_checkpoint",
+            epoch_state,
         )
 
     summary = {
