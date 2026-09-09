@@ -1,30 +1,20 @@
 """
-PyTorch datasets for the SAGE crop-disease task.
+PyTorch datasets for SAGE crop-disease VLM fine-tuning.
 
-The project supports three access patterns:
-  1. Hugging Face streaming (reads samples from the Hub without materialising
-     the full dataset locally).
-  2. Temporary Parquet shards downloaded by src/train.py in rolling/chunked
-     mode. Only the active shards are kept on Kaggle disk.
-  3. Ordinary local Parquet files.
-
-A sample can be prepared in either:
-  - training mode: image + prompt + ground-truth answer, with prompt tokens
-    masked out in labels;
-  - generation/evaluation mode: image + prompt only. The answer is never
-    included in model inputs, preventing label leakage during generation.
+Chunked Kaggle mode downloads only the currently active Parquet shards to
+/kaggle/working/data_cache/train. The files are deleted by train.py after the
+model has finished learning from that chunk.
 """
 
+import glob
 import io
 import os
-import glob
 import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 import pandas as pd
 from PIL import Image
-
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
@@ -35,36 +25,18 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.prompts import build_conversation
 
 
-# -----------------------------------------------------------------------------
-# Image decoding
-# -----------------------------------------------------------------------------
-
 def _decode_image(raw) -> Image.Image:
-    """Decode a SAGE image from PIL, raw bytes, or an HF image dictionary."""
+    """Decode a PIL image, raw bytes, or HF image dict into RGB."""
     if isinstance(raw, Image.Image):
         return raw.convert("RGB")
-
     if isinstance(raw, bytes):
         return Image.open(io.BytesIO(raw)).convert("RGB")
-
-    if isinstance(raw, dict):
-        data = raw.get("bytes")
+    if isinstance(raw, dict) and "bytes" in raw:
+        data = raw["bytes"]
         if data:
             return Image.open(io.BytesIO(data)).convert("RGB")
+    raise ValueError(f"Cannot decode image of type {type(raw)}: {str(raw)[:120]}")
 
-        # Some HF image features may expose a path instead of bytes.
-        path = raw.get("path")
-        if path and os.path.exists(path):
-            return Image.open(path).convert("RGB")
-
-    raise ValueError(
-        f"Cannot decode image of type {type(raw)}: {str(raw)[:120]}"
-    )
-
-
-# -----------------------------------------------------------------------------
-# Sample processing
-# -----------------------------------------------------------------------------
 
 def _process_sample(
     row: Dict[str, Any],
@@ -76,7 +48,11 @@ def _process_sample(
     label_id_col: Optional[str],
     label2id: Dict[str, int],
 ) -> Dict[str, Any]:
-    """Convert one raw dataset row into Qwen2.5-VL inputs."""
+    """
+    Create either:
+      - training/validation-loss format: prompt + answer + labels
+      - generation format: prompt only, no answer tokens
+    """
     image = _decode_image(row[image_col])
     disease = str(row[disease_col]).strip()
     crop = str(row.get(crop_col, "")).strip() if crop_col else ""
@@ -84,10 +60,8 @@ def _process_sample(
     if label_id_col and label_id_col in row and row[label_id_col] is not None:
         label_id = int(row[label_id_col])
     else:
-        label_id = label2id.get(disease, -1)
+        label_id = int(label2id.get(disease, -1))
 
-    # IMPORTANT: this conversation contains no answer. It is used both for
-    # generation evaluation and as the prefix of the supervised conversation.
     prompt_msgs = build_conversation(
         image=image,
         disease_label=None,
@@ -100,97 +74,93 @@ def _process_sample(
         add_generation_prompt=True,
     )
 
-    if not is_training:
+    if is_training:
+        full_msgs = build_conversation(
+            image=image,
+            disease_label=disease,
+            include_crop=bool(crop),
+            crop_name=crop,
+        )
+        full_text = processor.apply_chat_template(
+            full_msgs,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
         inputs = processor(
-            text=[prompt_text],
+            text=[full_text],
             images=[image],
             return_tensors="pt",
         )
+        input_ids = inputs["input_ids"][0]
+        attention_mask = inputs["attention_mask"][0]
+        pixel_values = inputs["pixel_values"]
+        grid_thw = inputs.get("image_grid_thw")
+        if grid_thw is None:
+            raise ValueError("Qwen processor did not return image_grid_thw.")
+
+        # Tokenize the text portions separately to locate the start of the
+        # assistant answer. The visual tokens are inserted between the text
+        # representation and the final model input, so preserve the original
+        # repository's visual-token offset calculation.
+        full_tok_len = processor.tokenizer(
+            full_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )["input_ids"].shape[1]
+        prompt_tok_len = processor.tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )["input_ids"].shape[1]
+
+        visual_tokens = input_ids.shape[0] - full_tok_len
+        boundary = max(
+            0,
+            min(visual_tokens + prompt_tok_len, input_ids.shape[0]),
+        )
+
+        labels = input_ids.clone()
+        labels[:boundary] = -100
 
         return {
             "disease": disease,
             "crop": crop,
             "label_id": label_id,
-            "input_ids": inputs["input_ids"][0],
-            "attention_mask": inputs["attention_mask"][0],
-            "pixel_values": inputs["pixel_values"],
-            "image_grid_thw": inputs.get("image_grid_thw"),
-            "prompt_text": prompt_text,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": grid_thw,
+            "labels": labels,
+            "pad_token_id": processor.tokenizer.pad_token_id,
         }
 
-    # Training: append the ground-truth assistant answer.
-    full_msgs = build_conversation(
-        image=image,
-        disease_label=disease,
-        include_crop=bool(crop),
-        crop_name=crop,
-    )
-    full_text = processor.apply_chat_template(
-        full_msgs,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-
+    # Generation/evaluation path. The disease label is deliberately NOT put
+    # into the prompt. It is returned separately only for scoring.
     inputs = processor(
-        text=[full_text],
+        text=[prompt_text],
         images=[image],
         return_tensors="pt",
     )
-
-    input_ids = inputs["input_ids"][0]
-    attn_mask = inputs["attention_mask"][0]
-    pixel_values = inputs["pixel_values"]
     grid_thw = inputs.get("image_grid_thw")
-
-    # Qwen's processor expands image placeholders into visual tokens. We need
-    # to account for that expansion when locating the beginning of the answer.
-    full_tok_len = processor.tokenizer(
-        full_text,
-        add_special_tokens=False,
-        return_tensors="pt",
-    )["input_ids"].shape[1]
-    prompt_tok_len = processor.tokenizer(
-        prompt_text,
-        add_special_tokens=False,
-        return_tensors="pt",
-    )["input_ids"].shape[1]
-
-    visual_tokens = max(0, input_ids.shape[0] - full_tok_len)
-    boundary = max(
-        0,
-        min(visual_tokens + prompt_tok_len, input_ids.shape[0]),
-    )
-
-    labels = input_ids.clone()
-    labels[:boundary] = -100
-
-    # Sanity check: at least one target token should remain unmasked. If the
-    # processor/template changes in a future Transformers version, fail early
-    # instead of silently training on an empty target.
-    if not torch.any(labels != -100):
-        raise ValueError(
-            "No target tokens remained after prompt masking. "
-            "The Qwen chat-template boundary calculation needs updating."
-        )
+    if grid_thw is None:
+        raise ValueError("Qwen processor did not return image_grid_thw.")
 
     return {
         "disease": disease,
         "crop": crop,
         "label_id": label_id,
-        "input_ids": input_ids,
-        "attention_mask": attn_mask,
-        "pixel_values": pixel_values,
+        "input_ids": inputs["input_ids"][0],
+        "attention_mask": inputs["attention_mask"][0],
+        "pixel_values": inputs["pixel_values"],
         "image_grid_thw": grid_thw,
-        "labels": labels,
+        "prompt_text": prompt_text,
+        "pad_token_id": processor.tokenizer.pad_token_id,
     }
 
 
-# -----------------------------------------------------------------------------
-# Hugging Face streaming dataset
-# -----------------------------------------------------------------------------
-
 class StreamingSAGEDataset(IterableDataset):
-    """Stream SAGE samples from Hugging Face without downloading the dataset."""
+    """Optional Hugging Face streaming dataset path."""
 
     def __init__(
         self,
@@ -205,16 +175,12 @@ class StreamingSAGEDataset(IterableDataset):
         label_id_col: str = "",
         label2id: Optional[Dict[str, int]] = None,
         seed: int = 42,
-        shuffle_buffer: int = 1000,
     ):
         from datasets import load_dataset
 
-        print(
-            f"[StreamingDataset] Connecting to {repo_id} "
-            f"(streaming=True, split={split})..."
-        )
+        print(f"[StreamingDataset] Connecting to {repo_id} (streaming=True, split={split})...")
         hf_ds = load_dataset(repo_id, split=split, streaming=True)
-        hf_ds = hf_ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
+        hf_ds = hf_ds.shuffle(seed=seed, buffer_size=1000)
         if max_samples:
             hf_ds = hf_ds.take(max_samples)
 
@@ -230,19 +196,14 @@ class StreamingSAGEDataset(IterableDataset):
         self.label2id = label2id or {}
 
     def _build_label2id_from_streaming(self, scan_samples: int = 5000):
-        """Build a vocabulary from a bounded HF streaming scan."""
         from datasets import load_dataset
 
-        print(
-            f"[StreamingDataset] Scanning {scan_samples} samples "
-            "to build label vocab..."
-        )
+        print(f"[StreamingDataset] Scanning {scan_samples} samples to build label vocab...")
         scan_stream = (
             load_dataset(self.repo_id, split="train", streaming=True)
             .shuffle(seed=42, buffer_size=1000)
             .take(scan_samples)
         )
-
         labels = set()
         for row in scan_stream:
             lbl = row.get(self.disease_col)
@@ -250,9 +211,7 @@ class StreamingSAGEDataset(IterableDataset):
                 labels.add(str(lbl).strip())
 
         self.label2id = {label: i for i, label in enumerate(sorted(labels))}
-        print(
-            f"[StreamingDataset] Found {len(self.label2id)} disease classes."
-        )
+        print(f"[StreamingDataset] Found {len(self.label2id)} disease classes.")
         return self.label2id
 
     def __iter__(self):
@@ -268,28 +227,23 @@ class StreamingSAGEDataset(IterableDataset):
                     self.label_id_col,
                     self.label2id,
                 )
-            except Exception as exc:
-                # Do not silently hide data-quality problems. Keep the run
-                # alive, but make the skipped sample visible in the log.
-                print(
-                    f"[StreamingDataset] Skipping invalid sample: {exc}",
-                    flush=True,
-                )
+            except Exception:
+                continue
 
     def __len__(self):
         if self.max_samples:
             return self.max_samples
-        raise TypeError(
-            "StreamingSAGEDataset length is unknown without max_samples."
-        )
+        raise TypeError("StreamingSAGEDataset length is unknown without max_samples.")
 
-
-# -----------------------------------------------------------------------------
-# Map-style Parquet dataset
-# -----------------------------------------------------------------------------
 
 class SAGEDataset(Dataset):
-    """Load one or more local Parquet shards into a map-style dataset."""
+    """
+    Map-style dataset over the Parquet files currently present in parquet_dir.
+
+    In rolling-window mode train.py ensures parquet_dir contains only the
+    active 1-2 training shards. Therefore this Dataset never represents the
+    complete 20+ GB dataset in memory.
+    """
 
     def __init__(
         self,
@@ -316,13 +270,6 @@ class SAGEDataset(Dataset):
             f"Columns: {list(self._df.columns)}"
         )
 
-        required = {image_col, disease_col}
-        missing = required - set(self._df.columns)
-        if missing:
-            raise KeyError(
-                f"Missing required dataset columns: {sorted(missing)}"
-            )
-
         self.processor = processor
         self.is_training = is_training
         self.image_col = image_col
@@ -334,8 +281,8 @@ class SAGEDataset(Dataset):
             self.label2id = dict(label2id)
         else:
             labels = sorted(
-                str(label).strip()
-                for label in self._df[disease_col].dropna().unique().tolist()
+                str(x).strip()
+                for x in self._df[disease_col].dropna().unique().tolist()
             )
             self.label2id = {label: i for i, label in enumerate(labels)}
 
@@ -356,47 +303,35 @@ class SAGEDataset(Dataset):
         )
 
 
-# -----------------------------------------------------------------------------
-# Collation
-# -----------------------------------------------------------------------------
-
-def sage_collate_fn(
-    batch: List[Dict[str, Any]],
-    pad_token_id: int = 0,
-) -> Dict[str, Any]:
-    """Left-pad text tensors and concatenate Qwen visual tensors."""
+def sage_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Left-pad text sequences and concatenate Qwen visual tensors."""
     if not batch:
-        raise ValueError("Cannot collate an empty batch.")
+        raise ValueError("sage_collate_fn received an empty batch")
+
+    pad_id = batch[0].get("pad_token_id")
+    if pad_id is None:
+        pad_id = 0
 
     max_len = max(item["input_ids"].shape[0] for item in batch)
-
     input_ids_list = []
-    attn_list = []
+    attention_list = []
+
     for item in batch:
         seq = item["input_ids"]
         pad = max_len - seq.shape[0]
-
         input_ids_list.append(
-            torch.cat(
-                [
-                    torch.full(
-                        (pad,),
-                        pad_token_id,
-                        dtype=seq.dtype,
-                    ),
-                    seq,
-                ]
-            )
+            torch.cat([
+                torch.full((pad,), pad_id, dtype=seq.dtype),
+                seq,
+            ])
         )
 
         attn = item["attention_mask"]
-        attn_list.append(
-            torch.cat(
-                [
-                    torch.zeros(pad, dtype=attn.dtype),
-                    attn,
-                ]
-            )
+        attention_list.append(
+            torch.cat([
+                torch.zeros(pad, dtype=attn.dtype),
+                attn,
+            ])
         )
 
     result = {
@@ -407,7 +342,7 @@ def sage_collate_fn(
             dtype=torch.long,
         ),
         "input_ids": torch.stack(input_ids_list),
-        "attention_mask": torch.stack(attn_list),
+        "attention_mask": torch.stack(attention_list),
         "pixel_values": torch.cat(
             [item["pixel_values"] for item in batch],
             dim=0,
@@ -418,27 +353,20 @@ def sage_collate_fn(
         ),
     }
 
-    # Training batches have labels; generation batches intentionally do not.
-    if all("labels" in item for item in batch):
+    if "labels" in batch[0]:
         labels_list = []
         for item in batch:
             labels = item["labels"]
             pad = max_len - labels.shape[0]
             labels_list.append(
-                torch.cat(
-                    [
-                        torch.full(
-                            (pad,),
-                            -100,
-                            dtype=labels.dtype,
-                        ),
-                        labels,
-                    ]
-                )
+                torch.cat([
+                    torch.full((pad,), -100, dtype=labels.dtype),
+                    labels,
+                ])
             )
         result["labels"] = torch.stack(labels_list)
 
-    if all("prompt_text" in item for item in batch):
+    if "prompt_text" in batch[0]:
         result["prompt_text"] = [item["prompt_text"] for item in batch]
 
     return result
