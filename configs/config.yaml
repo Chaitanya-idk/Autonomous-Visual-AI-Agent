@@ -64,8 +64,8 @@ evaluation:
 
 training:
   seed: 42
-  batch_size: 4
-  gradient_accumulation_steps: 8
+  batch_size: 8
+  gradient_accumulation_steps: 4
   num_workers: 4
 
   learning_rate: 0.0001
@@ -74,7 +74,7 @@ training:
   num_epochs: 3
   early_stopping_patience: 2
 
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   fp16: true
   bf16: false
   max_grad_norm: 1.0
