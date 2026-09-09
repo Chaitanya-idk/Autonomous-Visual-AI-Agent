@@ -138,56 +138,123 @@ def build_datasets(cfg: Dict[str, Any], processor):
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-def validate(model, processor, val_loader, label2id, device, dtype, max_batches=200, epoch=None):
-    """Run validation with progress bar — capped at max_batches for streaming mode."""
+def validate(
+    model,
+    processor,
+    val_loss_loader,
+    val_gen_loader,
+    label2id,
+    device,
+    dtype,
+    max_batches=200,
+    epoch=None
+):
     model.eval()
-    total_loss, count = 0.0, 0
-    y_true, y_pred = [], []
 
-    desc = f"  Validation [Epoch {epoch}]" if epoch is not None else "  Validation"
-    val_pbar = tqdm(val_loader, total=max_batches, desc=desc, unit="batch", dynamic_ncols=True, leave=False)
+    total_loss = 0.0
+    loss_count = 0
 
+    y_true = []
+    y_pred = []
+
+    desc = (
+        f"  Validation [Epoch {epoch}]"
+        if epoch is not None
+        else "  Validation"
+    )
+
+    # ---------------------------------------------------------
+    # 1. Validation loss
+    # ---------------------------------------------------------
     with torch.no_grad():
-        for i, batch in enumerate(val_pbar):
+
+        for i, batch in enumerate(val_loss_loader):
+
             if i >= max_batches:
                 break
-            ids  = batch["input_ids"].to(device)
+
+            ids = batch["input_ids"].to(device)
             attn = batch["attention_mask"].to(device)
-            pv   = batch["pixel_values"].to(device, dtype=dtype)
-            thw  = batch["image_grid_thw"].to(device)
-            lbl  = batch["labels"].to(device)
+            pv = batch["pixel_values"].to(device, dtype=dtype)
+            thw = batch["image_grid_thw"].to(device)
+            labels = batch["labels"].to(device)
 
-            with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                out = model(input_ids=ids, attention_mask=attn,
-                            pixel_values=pv, image_grid_thw=thw, labels=lbl)
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=dtype
+            ):
+                out = model(
+                    input_ids=ids,
+                    attention_mask=attn,
+                    pixel_values=pv,
+                    image_grid_thw=thw,
+                    labels=labels
+                )
+
             total_loss += out.loss.item()
-            count += 1
+            loss_count += 1
 
-            # Generate prediction
-            gen_ids = model.generate(
-                input_ids=ids, attention_mask=attn,
-                pixel_values=pv, image_grid_thw=thw,
-                max_new_tokens=32, do_sample=False
+    avg_val_loss = total_loss / max(1, loss_count)
+
+    # ---------------------------------------------------------
+    # 2. Generative evaluation
+    # ---------------------------------------------------------
+    with torch.no_grad():
+
+        for i, batch in enumerate(val_gen_loader):
+
+            if i >= max_batches:
+                break
+
+            ids = batch["input_ids"].to(device)
+            attn = batch["attention_mask"].to(device)
+            pv = batch["pixel_values"].to(device, dtype=dtype)
+            thw = batch["image_grid_thw"].to(device)
+
+            true_id = batch["label_id"][0].item()
+
+            generated_ids = model.generate(
+                input_ids=ids,
+                attention_mask=attn,
+                pixel_values=pv,
+                image_grid_thw=thw,
+                max_new_tokens=32,
+                do_sample=False
             )
-            raw = processor.tokenizer.decode(
-                gen_ids[0, ids.shape[1]:], skip_special_tokens=True).strip()
-            _, pred_id, _ = match_prediction(raw, label2id)
 
-            true_id = batch["label_id"][0].item() if "label_id" in batch else -1
-            if true_id >= 0:
-                y_true.append(true_id)
-                y_pred.append(pred_id)
+            # Only decode newly generated tokens
+            prompt_len = ids.shape[1]
 
-            cur_acc = (sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp) / len(y_true)) if y_true else 0.0
-            val_pbar.set_postfix({
-                "val_loss": f"{total_loss / count:.4f}",
-                "acc": f"{cur_acc:.2%}",
-            })
+            new_tokens = generated_ids[
+                0,
+                prompt_len:
+            ]
 
-    metrics = compute_classification_metrics(y_true, y_pred)
-    metrics["val_loss"] = total_loss / max(1, count)
+            raw_text = processor.tokenizer.decode(
+                new_tokens,
+                skip_special_tokens=True
+            ).strip()
+
+            _, pred_id, status = match_prediction(
+                raw_text,
+                label2id
+            )
+
+            y_true.append(true_id)
+            y_pred.append(pred_id)
+
+    # ---------------------------------------------------------
+    # 3. Metrics
+    # ---------------------------------------------------------
+
+    metrics = compute_classification_metrics(
+        y_true,
+        y_pred
+    )
+
+    metrics["val_loss"] = float(avg_val_loss)
+
     return metrics
-
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
