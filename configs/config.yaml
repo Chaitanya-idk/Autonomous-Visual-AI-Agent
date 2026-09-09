@@ -35,7 +35,7 @@ dataset:
   # null/0 = process ALL training chunks in every epoch.
   # With 48 total shards and shard 47 reserved for validation:
   #   47 training shards -> 24 chunks at chunk_size=2.
-  max_chunks_per_epoch: 1
+  max_chunks_per_epoch: null
 
   # Used only to size the LR scheduler before chunks are downloaded.
   # The actual batch count is measured from every loaded chunk.
