@@ -462,6 +462,7 @@ def train(cfg: Dict[str, Any]) -> None:
     is_streaming = ds_mode == "streaming"
     batch_size = int(train_cfg.get("batch_size", 4))
     grad_accum = int(train_cfg.get("gradient_accumulation_steps", 8))
+    num_workers = int(train_cfg.get("num_workers", 2))
     num_epochs = int(train_cfg.get("num_epochs", 3))
     patience = int(train_cfg.get("early_stopping_patience", 2))
     lr = float(train_cfg.get("learning_rate", 1e-4))
@@ -529,7 +530,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=1,
             shuffle=False,
             collate_fn=sage_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
         )
         val_gen_loader = DataLoader(
@@ -537,7 +538,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=1,
             shuffle=False,
             collate_fn=sage_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
         )
         print(
@@ -585,7 +586,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=batch_size,
             shuffle=not is_streaming,
             collate_fn=sage_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
         )
         val_loss_loader = DataLoader(
@@ -593,7 +594,7 @@ def train(cfg: Dict[str, Any]) -> None:
             batch_size=1,
             shuffle=False,
             collate_fn=sage_collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
         )
         val_gen_loader = val_loss_loader
         steps_per_epoch_estimate = (
@@ -636,7 +637,7 @@ def train(cfg: Dict[str, Any]) -> None:
     print("\n" + "=" * 72)
     print(
         f"STARTING TRAINING | epochs={num_epochs} | patience={patience} | "
-        f"batch={batch_size} | grad_accum={grad_accum}"
+        f"batch={batch_size} | grad_accum={grad_accum} | workers={num_workers}"
     )
     print(f"Mode: {ds_mode.upper()} {'(FULL rolling-window pass)' if is_chunked else ''}")
     if is_chunked:
@@ -688,7 +689,7 @@ def train(cfg: Dict[str, Any]) -> None:
                     batch_size=batch_size,
                     shuffle=True,
                     collate_fn=sage_collate_fn,
-                    num_workers=2,
+                    num_workers=num_workers,
                     pin_memory=True,
                     persistent_workers=False,
                 )
