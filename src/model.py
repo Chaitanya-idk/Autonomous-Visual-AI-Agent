@@ -1,32 +1,51 @@
-"""
-Model loading: Qwen2.5-VL with full-precision LoRA (no quantization).
-Designed for GCP / Kaggle GPU instances (T4 16GB, L4 24GB, A100).
-"""
+"""Qwen2.5-VL model loading and LoRA adapter management."""
 
-import sys
 import torch
-from pathlib import Path
 from typing import Optional, List
 
 from transformers import Qwen2_5_VLForConditionalGeneration
 from peft import LoraConfig, get_peft_model, PeftModel
 
-# Kaggle / environment compatibility: handle outdated pre-installed torchao gracefully
+
+# Kaggle compatibility for environments where PEFT detects an incompatible
+# torchao installation even though torchao is not needed for this LoRA setup.
 try:
     import peft.import_utils
-    _orig_torchao_check = getattr(peft.import_utils, "is_torchao_available", None)
+
+    _orig_torchao_check = getattr(
+        peft.import_utils,
+        "is_torchao_available",
+        None,
+    )
+
     if _orig_torchao_check is not None:
         def _safe_torchao_check():
             try:
                 return _orig_torchao_check()
             except ImportError:
                 return False
+
         peft.import_utils.is_torchao_available = _safe_torchao_check
-    import peft.tuners.lora.torchao as _torchao_tuner
-    if hasattr(_torchao_tuner, "is_torchao_available"):
-        _torchao_tuner.is_torchao_available = _safe_torchao_check
+
+    try:
+        import peft.tuners.lora.torchao as _torchao_tuner
+        if hasattr(_torchao_tuner, "is_torchao_available"):
+            _torchao_tuner.is_torchao_available = _safe_torchao_check
+    except Exception:
+        pass
 except Exception:
     pass
+
+
+def _resolve_dtype(torch_dtype: str):
+    name = str(torch_dtype).lower()
+    if name in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if name in {"float16", "fp16", "half"}:
+        return torch.float16
+    raise ValueError(
+        f"Unsupported torch_dtype={torch_dtype!r}. Use float16 or bfloat16."
+    )
 
 
 def get_qwen_lora_model(
@@ -40,14 +59,11 @@ def get_qwen_lora_model(
     local_files_only: bool = False,
     is_trainable: bool = True,
 ):
-    """
-    Loads Qwen2.5-VL in full precision (bfloat16 or float16) and applies LoRA.
-    No quantization — requires ~7 GB VRAM for 3B model base.
-    """
+    """Load Qwen2.5-VL and attach a LoRA adapter."""
     if target_modules is None:
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-    dtype = torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
+    dtype = _resolve_dtype(torch_dtype)
 
     print(f"Loading {model_name_or_path} in {torch_dtype}...")
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -86,12 +102,10 @@ def load_trained_lora_model(
     torch_dtype: str = "bfloat16",
     local_files_only: bool = False,
     merge_weights: bool = False,
+    is_trainable: bool = False,
 ):
-    """
-    Loads base model and applies saved LoRA adapter.
-    Set merge_weights=True to produce a self-contained model (no PEFT needed at inference).
-    """
-    dtype = torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
+    """Load a base Qwen model and a saved LoRA adapter."""
+    dtype = _resolve_dtype(torch_dtype)
 
     base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         base_model_name_or_path,
@@ -99,7 +113,12 @@ def load_trained_lora_model(
         device_map="auto",
         local_files_only=local_files_only,
     )
-    model = PeftModel.from_pretrained(base, adapter_path)
+
+    model = PeftModel.from_pretrained(
+        base,
+        adapter_path,
+        is_trainable=is_trainable,
+    )
 
     if merge_weights:
         print("Merging LoRA weights into base model...")
