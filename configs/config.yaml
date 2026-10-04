@@ -80,6 +80,7 @@ training:
   bf16: false
   max_grad_norm: 1.0
   save_mode: "adapter"
+  resume: true
 
 paths:
   checkpoint_dir: "/kaggle/working/checkpoints"
