@@ -347,30 +347,45 @@ def _process_sample(
     label_id_col: Optional[str],
     label2id: Dict[str, int],
 ) -> Dict[str, Any]:
+    """
+    Process one SAGE row.
+
+    Ground-truth labels are validated strictly. An unknown disease is an
+    immediate error rather than silently becoming class -1.
+    """
 
     # -------------------------------------------------------------------------
-    # Decode image FIRST.
+    # Image
     # -------------------------------------------------------------------------
     try:
         image = _decode_image(row[image_col])
     except Exception as exc:
         raise ValueError(
-            f"Image decoding failed for sample. "
-            f"image_col='{image_col}', "
-            f"error={exc}"
+            f"Image decoding failed for column {image_col!r}: {exc}"
         ) from exc
 
-    # Final safety check.
     if not isinstance(image, Image.Image):
         raise TypeError(
             f"Decoded image is not PIL.Image.Image: {type(image)}"
         )
 
-    # Qwen2.5-VL expects RGB images.
     if image.mode != "RGB":
         image = image.convert("RGB")
 
-    disease = str(row[disease_col]).strip()
+    # -------------------------------------------------------------------------
+    # Ground truth
+    # -------------------------------------------------------------------------
+    disease_raw = row.get(disease_col)
+
+    if disease_raw is None:
+        raise ValueError(
+            f"Missing disease label in column {disease_col!r}."
+        )
+
+    disease = str(disease_raw).strip()
+
+    if not disease:
+        raise ValueError("Disease label is empty.")
 
     crop = (
         str(row.get(crop_col, "")).strip()
@@ -378,26 +393,53 @@ def _process_sample(
         else ""
     )
 
-    # -------------------------------------------------------------------------
-    # Label ID
-    # -------------------------------------------------------------------------
+    # If a dataset-provided ID exists, validate it. Otherwise use the
+    # authoritative label2id map.
     if (
         label_id_col
         and label_id_col in row
         and row[label_id_col] is not None
     ):
-        label_id = int(row[label_id_col])
+        try:
+            label_id = int(row[label_id_col])
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid label ID {row[label_id_col]!r} "
+                f"for disease {disease!r}."
+            ) from exc
+
+        if label_id < 0:
+            raise ValueError(
+                f"Negative ground-truth label ID {label_id} "
+                f"for disease {disease!r}."
+            )
+
+        # If an authoritative vocabulary exists, make sure the dataset's
+        # numeric ID agrees with it.
+        if disease in label2id and int(label2id[disease]) != label_id:
+            raise ValueError(
+                f"Label ID mismatch for {disease!r}: "
+                f"dataset={label_id}, vocabulary={label2id[disease]}"
+            )
     else:
-        label_id = label2id.get(disease, -1)
+        if disease not in label2id:
+            preview = sorted(label2id.keys())[:20]
+            raise ValueError(
+                f"Unknown ground-truth disease {disease!r}. "
+                f"It is missing from label2id. "
+                f"Known labels (first 20): {preview}"
+            )
+
+        label_id = int(label2id[disease])
+
+    if label_id < 0:
+        raise RuntimeError(
+            f"Invalid ground-truth label ID {label_id} "
+            f"for disease {disease!r}."
+        )
 
     # -------------------------------------------------------------------------
-    # Prompt only.
-    #
-    # IMPORTANT:
-    # There is NO answer in this conversation.
-    #
-    # This is used for generation/evaluation and as the prefix of the
-    # supervised training conversation.
+    # Prompt without answer
     # -------------------------------------------------------------------------
     prompt_msgs = build_conversation(
         image=image,
@@ -412,12 +454,10 @@ def _process_sample(
         add_generation_prompt=True,
     )
 
-    # =========================================================================
-    # GENERATION / EVALUATION MODE
-    # =========================================================================
-
+    # -------------------------------------------------------------------------
+    # Generation/evaluation mode
+    # -------------------------------------------------------------------------
     if not is_training:
-
         inputs = processor(
             text=[prompt_text],
             images=[image],
@@ -435,10 +475,9 @@ def _process_sample(
             "prompt_text": prompt_text,
         }
 
-    # =========================================================================
-    # TRAINING MODE
-    # =========================================================================
-
+    # -------------------------------------------------------------------------
+    # Training mode
+    # -------------------------------------------------------------------------
     full_msgs = build_conversation(
         image=image,
         disease_label=disease,
@@ -463,9 +502,10 @@ def _process_sample(
     pixel_values = inputs["pixel_values"]
     grid_thw = inputs.get("image_grid_thw")
 
-    # -------------------------------------------------------------------------
-    # Calculate token lengths before visual-token expansion.
-    # -------------------------------------------------------------------------
+    # The tokenizer sees text tokens only. Qwen's processor expands the image
+    # placeholder into additional visual tokens. The difference between the
+    # processed sequence length and the text-only sequence length is therefore
+    # the visual-token contribution.
     full_tok_len = processor.tokenizer(
         full_text,
         add_special_tokens=False,
@@ -478,10 +518,6 @@ def _process_sample(
         return_tensors="pt",
     )["input_ids"].shape[1]
 
-    # -------------------------------------------------------------------------
-    # Qwen's processor expands image placeholders into visual tokens.
-    # Account for that expansion when locating the assistant answer.
-    # -------------------------------------------------------------------------
     visual_tokens = max(
         0,
         input_ids.shape[0] - full_tok_len,
@@ -496,17 +532,20 @@ def _process_sample(
     )
 
     labels = input_ids.clone()
-
-    # Mask prompt tokens.
     labels[:boundary] = -100
 
-    # -------------------------------------------------------------------------
-    # Safety check.
-    # -------------------------------------------------------------------------
-    if not torch.any(labels != -100):
+    valid_target_tokens = int(
+        (labels != -100).sum().item()
+    )
+
+    if valid_target_tokens <= 0:
         raise ValueError(
-            "No target tokens remained after prompt masking. "
-            "The Qwen chat-template boundary calculation needs updating."
+            "No supervised target tokens remain after prompt masking. "
+            f"disease={disease!r}, "
+            f"full_text_tokens={full_tok_len}, "
+            f"prompt_tokens={prompt_tok_len}, "
+            f"visual_tokens={visual_tokens}, "
+            f"processed_tokens={input_ids.shape[0]}"
         )
 
     return {
