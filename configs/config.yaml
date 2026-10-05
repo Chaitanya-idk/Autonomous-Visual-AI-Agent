@@ -4,7 +4,7 @@
 # ============================================================
 
 model:
-  name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"
+  name_or_path: "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2"
   local_files_only: true
   torch_dtype: "float16"
 
