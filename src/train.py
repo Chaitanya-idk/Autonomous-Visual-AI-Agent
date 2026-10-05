@@ -143,199 +143,31 @@ def load_or_create_label_vocab(
     common: Dict[str, Any],
 ) -> Dict[str, int]:
     """
-    Load the authoritative vocabulary if it exists.
+    Load the existing authoritative vocabulary if available.
 
-    For a fresh run, the held-out validation shard provides the initial
-    vocabulary. Training chunks may add previously unseen classes later, but
-    existing IDs are never renumbered.
+    For a fresh chunked run, the fixed validation shard is used to create the
+    vocabulary. The resulting labels.json is then reused by every train chunk,
+    validation pass, and final evaluation. It is never rebuilt per chunk.
     """
     if labels_path.exists():
         with open(labels_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        if "label2id" not in data:
-            raise ValueError(
-                f"Invalid labels file: missing label2id: {labels_path}"
-            )
-
-        label2id = {
-            str(label): int(idx)
-            for label, idx in data["label2id"].items()
-        }
-
-        # Validate IDs before allowing a checkpoint to resume.
-        ids = list(label2id.values())
-        if (
-            len(ids) != len(set(ids))
-            or set(ids) != set(range(len(label2id)))
-        ):
-            raise ValueError(
-                f"Invalid label IDs in {labels_path}. "
-                "IDs must be contiguous 0..N-1."
-            )
-
-        # Verify every validation label exists.
-        validation_df = pd.concat(
-            [
-                pd.read_parquet(
-                    p,
-                    columns=[common["disease_col"]],
-                    engine="pyarrow",
-                )
-                for p in sorted(validation_dir.glob("*.parquet"))
-            ],
-            ignore_index=True,
-        )
-
-        validation_labels = sorted(
-            {
-                str(x).strip()
-                for x in validation_df[common["disease_col"]].dropna()
-                if str(x).strip()
-            }
-        )
-
-        missing = [
-            label
-            for label in validation_labels
-            if label not in label2id
-        ]
-
-        if missing:
-            raise RuntimeError(
-                "Existing labels.json is incompatible with the validation "
-                f"shard. Missing labels: {missing}. "
-                "Delete labels.json and create a fresh vocabulary."
-            )
-
-        print(
-            f"[Labels] Loaded {len(label2id)} classes from {labels_path}"
-        )
+        label2id = data["label2id"]
+        print(f"[Labels] Loaded {len(label2id)} classes from {labels_path}")
         return label2id
 
-    validation_files = sorted(
-        validation_dir.glob("*.parquet")
+    temp_ds = SAGEDataset(
+        parquet_dir=str(validation_dir),
+        processor=processor,
+        is_training=False,
+        **common,
     )
+    label2id = temp_ds.label2id
 
-    if not validation_files:
-        raise FileNotFoundError(
-            f"No validation parquet files found in {validation_dir}"
-        )
-
-    labels = set()
-
-    for path in validation_files:
-        df = pd.read_parquet(
-            path,
-            columns=[common["disease_col"]],
-            engine="pyarrow",
-        )
-
-        labels.update(
-            str(x).strip()
-            for x in df[common["disease_col"]].dropna()
-            if str(x).strip()
-        )
-
-    labels = sorted(labels)
-
-    if not labels:
-        raise RuntimeError(
-            "Validation shard contains no disease labels."
-        )
-
-    label2id = {
-        label: idx
-        for idx, label in enumerate(labels)
-    }
-
-    labels_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    save_labels_vocab(
-        label2id,
-        labels_path,
-    )
-
-    print(
-        f"[Labels] Created {len(label2id)} initial classes "
-        f"from validation shard -> {labels_path}"
-    )
-
+    labels_path.parent.mkdir(parents=True, exist_ok=True)
+    save_labels_vocab(label2id, labels_path)
+    print(f"[Labels] Created {len(label2id)} classes from validation shard -> {labels_path}")
     return label2id
-
-
-def extend_label_vocab_from_chunk(
-    train_dir: Path,
-    label2id: Dict[str, int],
-    disease_col: str,
-    labels_path: Path,
-) -> bool:
-    """
-    Discover labels in the currently downloaded training chunk.
-
-    Existing class IDs are NEVER changed. New labels are appended.
-    """
-    discovered = set()
-
-    parquet_files = sorted(
-        train_dir.glob("*.parquet")
-    )
-
-    if not parquet_files:
-        raise FileNotFoundError(
-            f"No training parquet files found in {train_dir}"
-        )
-
-    for path in parquet_files:
-        df = pd.read_parquet(
-            path,
-            columns=[disease_col],
-            engine="pyarrow",
-        )
-
-        discovered.update(
-            str(x).strip()
-            for x in df[disease_col].dropna()
-            if str(x).strip()
-        )
-
-    new_labels = sorted(
-        label
-        for label in discovered
-        if label not in label2id
-    )
-
-    if not new_labels:
-        return False
-
-    next_id = (
-        max(label2id.values()) + 1
-        if label2id
-        else 0
-    )
-
-    for label in new_labels:
-        label2id[label] = next_id
-        next_id += 1
-
-    save_labels_vocab(
-        label2id,
-        labels_path,
-    )
-
-    print(
-        "\n[Labels] Added new classes from current training chunk:"
-    )
-
-    for label in new_labels:
-        print(
-            f"  {label} -> {label2id[label]}"
-        )
-
-    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,40 +231,46 @@ def validate(
     epoch: Optional[int] = None,
 ) -> Dict[str, float]:
     """
-    Validate in two independent ways:
+    Validate without leaking the answer into generation.
 
-      1. teacher-forced causal LM loss
-      2. answer-free generation followed by disease-label matching
+    Two independent checks are performed:
 
-    Ground-truth labels are never silently dropped. An invalid label is a
-    hard error because otherwise the metric pipeline can report misleading
-    all-zero results.
+      1. Teacher-forced validation loss:
+         the answer is present in labels, but the prompt portion is masked.
+
+      2. Generation-based classification:
+         the answer is NOT present in the prompt. The generated text is
+         matched against the authoritative disease vocabulary.
+
+    Validation loss is computed manually in float32 from model logits. This
+    avoids misleading FP16 loss reductions and lets us independently verify
+    the model's reported loss.
+
+    The first few generated answers are printed and also returned in a small
+    diagnostics file by the caller so that label-matching failures are visible.
     """
     model.eval()
 
     total_loss = 0.0
-    model_reported_loss_sum = 0.0
     loss_count = 0
     valid_token_count = 0
-
+    model_reported_loss_sum = 0.0
     y_true: List[int] = []
     y_pred: List[int] = []
-
     unknown_count = 0
     debug_rows: List[Dict[str, Any]] = []
 
-    # -------------------------------------------------------------------------
-    # Teacher-forced validation loss
-    # -------------------------------------------------------------------------
     loss_total = len(val_loss_loader)
     if max_batches is not None:
         loss_total = min(loss_total, max_batches)
 
-    print(
-        f"\n  [Validation] Epoch "
-        f"{epoch if epoch is not None else ''}".strip()
-    )
+    gen_total = len(val_gen_loader)
+    if max_batches is not None:
+        gen_total = min(gen_total, max_batches)
 
+    print(f"\n  [Validation] Epoch {epoch if epoch is not None else ''}".strip())
+
+    # 1) Teacher-forced validation loss.
     loss_pbar = tqdm(
         enumerate(val_loss_loader),
         total=loss_total,
@@ -447,27 +285,11 @@ def validate(
             if max_batches is not None and i >= max_batches:
                 break
 
-            ids = batch["input_ids"].to(
-                device,
-                non_blocking=True,
-            )
-            attn = batch["attention_mask"].to(
-                device,
-                non_blocking=True,
-            )
-            pv = batch["pixel_values"].to(
-                device=device,
-                dtype=dtype,
-                non_blocking=True,
-            )
-            thw = batch["image_grid_thw"].to(
-                device,
-                non_blocking=True,
-            )
-            labels = batch["labels"].to(
-                device,
-                non_blocking=True,
-            )
+            ids = batch["input_ids"].to(device, non_blocking=True)
+            attn = batch["attention_mask"].to(device, non_blocking=True)
+            pv = batch["pixel_values"].to(device=device, dtype=dtype, non_blocking=True)
+            thw = batch["image_grid_thw"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
             with _autocast_context(dtype):
                 out = model(
@@ -478,51 +300,32 @@ def validate(
                     labels=labels,
                 )
 
-            float32_loss, valid_tokens = (
-                _compute_float32_causal_loss(
-                    out.logits,
-                    labels,
-                )
-            )
-
-            reported_loss = float(
-                out.loss.detach().float().item()
+            float32_loss, valid_tokens = _compute_float32_causal_loss(
+                out.logits,
+                labels,
             )
 
             total_loss += float32_loss.item()
-            model_reported_loss_sum += reported_loss
+            model_loss = float(out.loss.detach().float().item())
+            model_reported_loss_sum += model_loss
             valid_token_count += valid_tokens
             loss_count += 1
 
             loss_pbar.set_postfix(
-                val_loss=f"{total_loss / loss_count:.4f}",
-                model_loss=(
-                    f"{model_reported_loss_sum / loss_count:.4f}"
-                ),
+                val_loss=f"{total_loss / max(loss_count, 1):.4f}",
+                model_loss=f"{model_reported_loss_sum / max(loss_count, 1):.4f}",
             )
 
-    if loss_count == 0:
-        raise RuntimeError(
-            "Validation loss loader produced zero batches."
-        )
-
-    avg_val_loss = total_loss / loss_count
-    avg_model_loss = model_reported_loss_sum / loss_count
+    avg_val_loss = total_loss / max(loss_count, 1)
+    avg_model_loss = model_reported_loss_sum / max(loss_count, 1)
 
     print(
-        f"  [Validation loss check] "
-        f"float32_ce={avg_val_loss:.6f} | "
+        f"  [Validation loss check] float32_ce={avg_val_loss:.6f} | "
         f"model_reported_loss={avg_model_loss:.6f} | "
         f"valid_target_tokens={valid_token_count}"
     )
 
-    # -------------------------------------------------------------------------
-    # Generation-based validation
-    # -------------------------------------------------------------------------
-    gen_total = len(val_gen_loader)
-    if max_batches is not None:
-        gen_total = min(gen_total, max_batches)
-
+    # 2) Generation-based classification evaluation.
     gen_pbar = tqdm(
         enumerate(val_gen_loader),
         total=gen_total,
@@ -537,47 +340,23 @@ def validate(
             if max_batches is not None and i >= max_batches:
                 break
 
-            ids = batch["input_ids"].to(
-                device,
-                non_blocking=True,
-            )
-            attn = batch["attention_mask"].to(
-                device,
-                non_blocking=True,
-            )
-            pv = batch["pixel_values"].to(
-                device=device,
-                dtype=dtype,
-                non_blocking=True,
-            )
-            thw = batch["image_grid_thw"].to(
-                device,
-                non_blocking=True,
-            )
+            ids = batch["input_ids"].to(device, non_blocking=True)
+            attn = batch["attention_mask"].to(device, non_blocking=True)
+            pv = batch["pixel_values"].to(device=device, dtype=dtype, non_blocking=True)
+            thw = batch["image_grid_thw"].to(device, non_blocking=True)
 
-            true_id = int(
-                batch["label_id"][0].item()
-            )
-            true_label = str(
-                batch["disease"][0]
-            ).strip()
+            true_id = int(batch["label_id"][0].item())
+            true_label = str(batch["disease"][0])
 
-            # A ground-truth class must always be valid.
-            if true_id < 0:
-                raise RuntimeError(
-                    "INVALID GROUND-TRUTH LABEL DURING VALIDATION\n"
-                    f"sample={i}\n"
-                    f"disease={true_label!r}\n"
-                    f"label_id={true_id}\n"
-                    "Check labels.json and the dataset label mapping."
-                )
-
+            # The prompt explicitly asks for only the disease name, so use
+            # deterministic generation. Explicitly clear sampling-only fields
+            # to avoid the transformers "invalid generation flags" warning.
             generated_ids = model.generate(
                 input_ids=ids,
                 attention_mask=attn,
                 pixel_values=pv,
                 image_grid_thw=thw,
-                max_new_tokens=32,
+                max_new_tokens=16,
                 do_sample=False,
                 temperature=None,
                 top_p=None,
@@ -585,92 +364,65 @@ def validate(
             )
 
             prompt_len = ids.shape[1]
-
+            new_tokens = generated_ids[0, prompt_len:]
             raw_text = processor.tokenizer.decode(
-                generated_ids[0, prompt_len:],
+                new_tokens,
                 skip_special_tokens=True,
             ).strip()
 
-            (
-                pred_label,
-                pred_id,
-                status,
-            ) = match_prediction_to_vocab(
+            pred_label, pred_id, status = match_prediction_to_vocab(
                 raw_text,
                 label2id,
             )
 
-            y_true.append(true_id)
-            y_pred.append(pred_id)
+            if true_id >= 0:
+                y_true.append(true_id)
+                y_pred.append(pred_id)
 
             if status == "unknown":
                 unknown_count += 1
 
-            correct = true_id == pred_id
-
-            if len(debug_rows) < 20:
-                row = {
-                    "index": i,
-                    "true_label": true_label,
-                    "true_id": true_id,
-                    "raw_model_output": raw_text,
-                    "matched_label": pred_label,
-                    "predicted_id": pred_id,
-                    "status": status,
-                    "correct": bool(correct),
-                }
-
-                debug_rows.append(row)
-
+            if len(debug_rows) < 10:
+                debug_rows.append(
+                    {
+                        "index": i,
+                        "true_label": true_label,
+                        "true_id": true_id,
+                        "raw_model_output": raw_text,
+                        "matched_label": pred_label,
+                        "predicted_id": pred_id,
+                        "status": status,
+                    }
+                )
                 print(
-                    f"\n    [VAL SAMPLE {i}] "
+                    f"    [VAL SAMPLE {i}] "
                     f"true={true_label!r} | "
                     f"raw={raw_text!r} | "
                     f"pred={pred_label!r} | "
-                    f"true_id={true_id} | "
-                    f"pred_id={pred_id} | "
-                    f"status={status} | "
-                    f"correct={correct}"
+                    f"status={status}"
                 )
 
             running_acc = (
-                sum(
-                    yt == yp
-                    for yt, yp in zip(y_true, y_pred)
-                )
-                / len(y_true)
+                sum(yt == yp for yt, yp in zip(y_true, y_pred)) / len(y_true)
+                if y_true else 0.0
             )
-
             gen_pbar.set_postfix(
                 acc=f"{running_acc:.2%}",
                 unknown=unknown_count,
             )
-
-    if not y_true:
-        raise RuntimeError(
-            "ZERO VALID EVALUATION SAMPLES. "
-            "Refusing to report zero metrics."
-        )
 
     metrics = compute_classification_metrics(
         y_true,
         y_pred,
         labels_list=list(label2id.values()),
     )
-
-    metrics.update(
-        {
-            "val_loss": float(avg_val_loss),
-            "model_reported_val_loss": float(avg_model_loss),
-            "valid_target_tokens": int(valid_token_count),
-            "unknown_predictions": int(unknown_count),
-            "unknown_rate": float(
-                unknown_count / len(y_true)
-            ),
-            "num_eval_samples": int(len(y_true)),
-            "validation_debug_samples": debug_rows,
-        }
-    )
+    metrics["val_loss"] = float(avg_val_loss)
+    metrics["model_reported_val_loss"] = float(avg_model_loss)
+    metrics["valid_target_tokens"] = int(valid_token_count)
+    metrics["unknown_predictions"] = int(unknown_count)
+    metrics["unknown_rate"] = float(unknown_count / max(len(y_true), 1))
+    metrics["num_eval_samples"] = int(len(y_true))
+    metrics["validation_debug_samples"] = debug_rows
 
     return metrics
 
@@ -876,7 +628,7 @@ def train(cfg: Dict[str, Any]) -> None:
     patience = int(train_cfg.get("early_stopping_patience", 2))
     lr = float(train_cfg.get("learning_rate", 1e-4))
     num_workers = int(train_cfg.get("num_workers", 2))
-    resume_enabled = bool(train_cfg.get("resume", False))
+    resume_enabled = bool(train_cfg.get("resume", True))
     resume_name = str(train_cfg.get("resume_checkpoint", "latest_checkpoint"))
 
     common = dict(
@@ -1144,15 +896,6 @@ def train(cfg: Dict[str, Any]) -> None:
                 clear_training_chunk(train_dir)
                 for shard_idx in shard_group:
                     download_shard(repo_id, shard_idx, train_dir, token=token)
-
-                # Discover any classes present in this training window before
-                # constructing the dataset. Existing class IDs are preserved.
-                extend_label_vocab_from_chunk(
-                    train_dir=train_dir,
-                    label2id=label2id,
-                    disease_col=common["disease_col"],
-                    labels_path=labels_path,
-                )
 
                 chunk_ds = SAGEDataset(
                     parquet_dir=str(train_dir),

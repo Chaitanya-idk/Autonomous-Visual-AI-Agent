@@ -333,6 +333,41 @@ def _decode_image(raw) -> Image.Image:
     )
 
 
+def _finalize_rgb_image(image: Image.Image) -> Image.Image:
+    """
+    Finalize an image before it reaches the Qwen image processor.
+
+    Qwen/Transformers can infer the channel axis incorrectly for pathological
+    tiny images such as (1, 30, 3).  A PIL RGB image normally represents this
+    correctly, but the downstream NumPy conversion sees a height of 1 and may
+    decide that the first dimension is the channel dimension.
+
+    We therefore:
+      - force RGB mode;
+      - reject zero-sized images;
+      - expand any 1-pixel spatial dimension to at least 2 pixels;
+      - preserve the image content with nearest-neighbour resampling.
+
+    This is deliberately limited to pathological tiny dimensions. Normal SAGE
+    images are not resized here.
+    """
+    if not isinstance(image, Image.Image):
+        raise TypeError(f"Expected PIL image, got {type(image)}")
+
+    image = image.convert("RGB")
+
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Image has invalid dimensions: {(width, height)}")
+
+    if width == 1 or height == 1:
+        new_width = max(width, 2)
+        new_height = max(height, 2)
+        image = image.resize((new_width, new_height), Image.Resampling.NEAREST)
+
+    return image
+
+
 # =============================================================================
 # SAMPLE PROCESSING
 # =============================================================================
@@ -364,13 +399,7 @@ def _process_sample(
             f"Image decoding failed for column {image_col!r}: {exc}"
         ) from exc
 
-    if not isinstance(image, Image.Image):
-        raise TypeError(
-            f"Decoded image is not PIL.Image.Image: {type(image)}"
-        )
-
-    if image.mode != "RGB":
-        image = image.convert("RGB")
+    image = _finalize_rgb_image(image)
 
     # -------------------------------------------------------------------------
     # Ground truth
@@ -829,13 +858,14 @@ class SAGEDataset(Dataset):
             )
 
         except Exception as exc:
-
-            # Include the exact local dataset index. This is extremely useful
-            # if another malformed image is encountered during training.
-            raise RuntimeError(
-                f"Failed to process dataset sample idx={idx}. "
-                f"Error: {exc}"
-            ) from exc
+            # A single corrupt/pathological image must not terminate a many-hour
+            # rolling-window training run. Return None and let the collate
+            # function remove this sample from the current batch.
+            print(
+                f"[Dataset] Skipping invalid sample idx={idx}: {exc}",
+                flush=True,
+            )
+            return None
 
 
 # =============================================================================
@@ -843,16 +873,28 @@ class SAGEDataset(Dataset):
 # =============================================================================
 
 def sage_collate_fn(
-    batch: List[Dict[str, Any]],
+    batch: List[Optional[Dict[str, Any]]],
     pad_token_id: int = 0,
 ) -> Dict[str, Any]:
     """
     Left-pad text tensors and concatenate Qwen visual tensors.
     """
 
+    # Map-style workers can return None for an unreadable/corrupt sample.
+    # Remove those samples here so one bad image cannot kill the entire epoch.
+    original_size = len(batch)
+    batch = [item for item in batch if item is not None]
+
     if not batch:
-        raise ValueError(
-            "Cannot collate an empty batch."
+        raise RuntimeError(
+            f"All {original_size} samples in the DataLoader batch were invalid."
+        )
+
+    if len(batch) != original_size:
+        print(
+            f"[Collate] Dropped {original_size - len(batch)} invalid sample(s) "
+            f"from the current batch.",
+            flush=True,
         )
 
     max_len = max(
