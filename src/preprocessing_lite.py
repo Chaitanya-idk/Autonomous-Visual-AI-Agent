@@ -42,7 +42,7 @@ def _load_qwen25_processor_compat(
         )
 
     try:
-        from transformers import Qwen2_5_VLProcessor, Qwen2VLImageProcessor
+        from transformers import Qwen2_5_VLProcessor, Qwen2VLImageProcessor, Qwen2VLVideoProcessor
     except ImportError as exc:
         raise RuntimeError(
             "This Transformers installation cannot provide the Qwen2.5-VL "
@@ -78,9 +78,41 @@ def _load_qwen25_processor_compat(
         except Exception:
             chat_template = None
 
+    # Transformers 5.x validates that Qwen2_5_VLProcessor receives a
+    # BaseVideoProcessor instance, even when the application only supplies
+    # still images. In the Kaggle Transformers build used by this project,
+    # constructing Qwen2VLVideoProcessor from the image-only checkpoint
+    # config can return None. That causes ProcessorMixin validation to fail.
+    #
+    # SAGE contains still images only, so use an uninitialized
+    # Qwen2VLVideoProcessor instance strictly as the required type placeholder.
+    # No video-processing method is called by the image-only training path.
+    #
+    # We deliberately set the two attributes that Qwen2.5-VL would need if
+    # video processing were ever requested, while keeping the actual image
+    # processor fully functional.
+    try:
+        video_processor = object.__new__(Qwen2VLVideoProcessor)
+        video_processor.merge_size = int(image_config.get("merge_size", 2))
+        video_processor.temporal_patch_size = int(
+            image_config.get("temporal_patch_size", 2)
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not create the Qwen2VLVideoProcessor compatibility "
+            "placeholder required by Qwen2_5_VLProcessor."
+        ) from exc
+
+    if video_processor is None:
+        raise RuntimeError(
+            "Qwen2VLVideoProcessor compatibility placeholder unexpectedly "
+            "resolved to None."
+        )
+
     processor_kwargs = {
         "image_processor": image_processor,
         "tokenizer": tokenizer,
+        "video_processor": video_processor,
     }
     if chat_template:
         processor_kwargs["chat_template"] = chat_template
@@ -90,6 +122,10 @@ def _load_qwen25_processor_compat(
     print(
         "[Processor] AutoProcessor could not resolve the checkpoint image "
         "processor; using Qwen2VLImageProcessor compatibility fallback."
+    )
+    print(
+        f"[Processor] image_processor={type(processor.image_processor).__name__}, "
+        f"video_processor={type(processor.video_processor).__name__}"
     )
     return processor
 
