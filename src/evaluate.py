@@ -22,7 +22,6 @@ from typing import Dict, Any, List
 import torch
 import yaml
 from tqdm.auto import tqdm
-from transformers import AutoProcessor
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +37,7 @@ from src.utils import (
     match_prediction_to_vocab,
 )
 from src.train import download_shard
+from src.preprocessing_lite import get_processor
 
 
 def load_config(path: str = None):
@@ -104,29 +104,20 @@ def evaluate(
     # -------------------------------------------------------------------------
     # Processor
     # -------------------------------------------------------------------------
-    processor = AutoProcessor.from_pretrained(
-        cfg["model"]["name_or_path"],
-        local_files_only=cfg["model"].get(
-            "local_files_only",
-            False,
-        ),
-        use_fast=False,
-    )
-
     prep_cfg = cfg.get(
         "preprocessing",
         {},
     )
 
-    if prep_cfg.get("min_pixels"):
-        processor.image_processor.min_pixels = (
-            prep_cfg["min_pixels"]
-        )
-
-    if prep_cfg.get("max_pixels"):
-        processor.image_processor.max_pixels = (
-            prep_cfg["max_pixels"]
-        )
+    processor = get_processor(
+        model_name_or_path=cfg["model"]["name_or_path"],
+        local_files_only=cfg["model"].get(
+            "local_files_only",
+            False,
+        ),
+        min_pixels=prep_cfg.get("min_pixels"),
+        max_pixels=prep_cfg.get("max_pixels"),
+    )
 
     # -------------------------------------------------------------------------
     # Labels

@@ -36,7 +36,7 @@ import torch.nn.functional as F
 import yaml
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
-from transformers import AutoProcessor, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -51,6 +51,7 @@ from src.utils import (
 )
 from src.dataset import StreamingSAGEDataset, SAGEDataset, sage_collate_fn
 from src.model import get_qwen_lora_model
+from src.preprocessing_lite import get_processor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,15 +606,12 @@ def train(cfg: Dict[str, Any]) -> None:
         json.dump(cfg, f, indent=2)
 
     prep_cfg = cfg.get("preprocessing", {})
-    processor = AutoProcessor.from_pretrained(
-        cfg["model"]["name_or_path"],
+    processor = get_processor(
+        model_name_or_path=cfg["model"]["name_or_path"],
         local_files_only=cfg["model"].get("local_files_only", False),
-        use_fast=False,
+        min_pixels=prep_cfg.get("min_pixels"),
+        max_pixels=prep_cfg.get("max_pixels"),
     )
-    if prep_cfg.get("min_pixels"):
-        processor.image_processor.min_pixels = prep_cfg["min_pixels"]
-    if prep_cfg.get("max_pixels"):
-        processor.image_processor.max_pixels = prep_cfg["max_pixels"]
 
     ds_mode = ds_cfg.get(
         "mode",
