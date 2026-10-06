@@ -718,15 +718,9 @@ class StreamingSAGEDataset(IterableDataset):
                     self.label2id,
                 )
 
-            except Exception as exc:
-
-                # Keep the streaming run alive while making the problematic
-                # sample visible.
-                print(
-                    "[StreamingDataset] "
-                    f"Skipping invalid sample: {exc}",
-                    flush=True,
-                )
+            except Exception:
+                # Keep streaming output quiet; skip malformed samples.
+                continue
 
     def __len__(self):
 
@@ -857,14 +851,11 @@ class SAGEDataset(Dataset):
                 self.label2id,
             )
 
-        except Exception as exc:
-            # A single corrupt/pathological image must not terminate a many-hour
-            # rolling-window training run. Return None and let the collate
-            # function remove this sample from the current batch.
-            print(
-                f"[Dataset] Skipping invalid sample idx={idx}: {exc}",
-                flush=True,
-            )
+        except Exception:
+            # Keep the worker output quiet. Invalid samples are dropped by the
+            # collate function; a fully invalid batch still raises an error.
+            # This prevents thousands of worker print lines from flooding the
+            # Kaggle output cell.
             return None
 
 
@@ -888,13 +879,6 @@ def sage_collate_fn(
     if not batch:
         raise RuntimeError(
             f"All {original_size} samples in the DataLoader batch were invalid."
-        )
-
-    if len(batch) != original_size:
-        print(
-            f"[Collate] Dropped {original_size - len(batch)} invalid sample(s) "
-            f"from the current batch.",
-            flush=True,
         )
 
     max_len = max(

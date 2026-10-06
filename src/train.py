@@ -70,7 +70,7 @@ import torch.nn.functional as F
 
 import yaml
 
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from torch.utils.data import DataLoader
 
@@ -363,7 +363,11 @@ def extend_label_vocab_from_chunk(
     for parquet_path in parquet_files:
         df = pd.read_parquet(parquet_path, columns=[disease_col])
         for value in df[disease_col].dropna().tolist():
-            label = normalize_label_text(str(value))
+            # IMPORTANT: SAGEDataset matches ground-truth labels by the
+            # exact canonical string in the Parquet `disease` column.
+            # Do NOT normalize this value here; normalization is only for
+            # matching model-generated predictions.
+            label = str(value).strip()
             if label:
                 discovered.add(label)
 
@@ -391,6 +395,37 @@ def extend_label_vocab_from_chunk(
         )
 
     return label2id
+
+
+def validate_chunk_labels(
+    train_dir: Path,
+    label2id: Dict[str, int],
+    disease_col: str,
+) -> None:
+    """Fail before DataLoader workers start if any chunk label is missing."""
+    missing = set()
+    discovered = set()
+
+    for parquet_path in sorted(train_dir.glob("train-*.parquet")):
+        df = pd.read_parquet(parquet_path, columns=[disease_col], engine="pyarrow")
+        for value in df[disease_col].dropna().tolist():
+            label = str(value).strip()
+            if label:
+                discovered.add(label)
+
+    missing = sorted(label for label in discovered if label not in label2id)
+    if missing:
+        preview = missing[:50]
+        raise RuntimeError(
+            "Training chunk label vocabulary is incomplete BEFORE training. "
+            f"Missing {len(missing)} labels: {preview}"
+        )
+
+    print(
+        f"  [Labels] Preflight OK: {len(discovered)} chunk labels are present "
+        f"in the {len(label2id)}-class vocabulary.",
+        flush=True,
+    )
 
 
 # Validation
@@ -1323,6 +1358,13 @@ def train(cfg: Dict[str, Any]) -> None:
 
     labels_path = Path(cfg["paths"].get("labels_json", "/kaggle/working/labels.json"))
 
+    # A fresh run must not reuse a vocabulary produced by an older/incorrect
+    # training script. When resume=false, rebuild the authoritative vocabulary
+    # from validation shard 47 and then append raw training labels chunk-by-chunk.
+    if not resume_enabled and labels_path.exists():
+        print(f"[Labels] Fresh run: removing old vocabulary {labels_path}", flush=True)
+        labels_path.unlink()
+
 
 
     # ── Prepare data access ───────────────────────────────────────────────────
@@ -1848,6 +1890,12 @@ def train(cfg: Dict[str, Any]) -> None:
                     labels_path=labels_path,
                 )
 
+                validate_chunk_labels(
+                    train_dir=train_dir,
+                    label2id=label2id,
+                    disease_col=common["disease_col"],
+                )
+
                 chunk_ds = SAGEDataset(
 
                     parquet_dir=str(train_dir),
@@ -1900,7 +1948,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
                     dynamic_ncols=True,
 
-                    leave=True,
+                    leave=False,
 
                 )
 
@@ -2096,7 +2144,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
                 dynamic_ncols=True,
 
-                leave=True,
+                leave=False,
 
             )
 
