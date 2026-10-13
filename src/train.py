@@ -1,41 +1,15 @@
 """
-
 Training pipeline for SAGE crop-disease LoRA fine-tuning.
 
+Chunked mode downloads only a small rolling window of training shards, trains
+one persistent model across the chunks, then deletes each training chunk.
 
+This version uses an explicit split from config.yaml:
+- train shards: all shard indices not listed for validation or test
+- validation shards: used for per-epoch monitoring/early stopping
+- test shards: never downloaded or used by training; evaluate only after run
 
-Chunked mode is the primary Kaggle workflow:
-
-    - keep validation shard 47 on disk
-
-    - download two training Parquet shards at a time
-
-    - train the SAME in-memory LoRA model on that chunk
-
-    - delete the chunk
-
-    - continue with the next chunk
-
-    - after all training shards have been consumed, run validation
-
-    - repeat the complete training-shard pass for every epoch
-
-
-
-For the default 48-shard SAGE layout this means:
-
-    Epoch 1: [0,1] -> [2,3] -> ... -> [44,45] -> [46] -> validate [47]
-
-    Epoch 2: [0,1] -> [2,3] -> ... -> [44,45] -> [46] -> validate [47]
-
-    Epoch 3: [0,1] -> [2,3] -> ... -> [44,45] -> [46] -> validate [47]
-
-
-
-The base model is loaded exactly once. The LoRA weights are NOT reset between
-
-chunks or epochs.
-
+The base model is loaded once and LoRA weights persist across chunks/epochs.
 """
 
 
@@ -1357,14 +1331,23 @@ def train(cfg: Dict[str, Any]) -> None:
 
 
     labels_path = Path(cfg["paths"].get("labels_json", "/kaggle/working/labels.json"))
-
-    # A fresh run must not reuse a vocabulary produced by an older/incorrect
-    # training script. When resume=false, rebuild the authoritative vocabulary
-    # from validation shard 47 and then append raw training labels chunk-by-chunk.
-    if not resume_enabled and labels_path.exists():
-        print(f"[Labels] Fresh run: removing old vocabulary {labels_path}", flush=True)
-        labels_path.unlink()
-
+    # Preserve the complete vocabulary from the previous full pass over SAGE.
+    # Support both paths used in earlier notebook runs.
+    if is_chunked and not labels_path.exists():
+        candidates = [
+            Path("/kaggle/working/outputs/labels.json"),
+            Path("/kaggle/working/labels.json"),
+        ]
+        found = next((candidate for candidate in candidates if candidate.exists()), None)
+        if found is not None:
+            labels_path = found
+            print(f"[Labels] Using existing vocabulary at {labels_path}", flush=True)
+        else:
+            raise FileNotFoundError(
+                f"Authoritative labels vocabulary not found at {labels_path}. "
+                "Copy the complete labels.json from the previous run to this path "
+                "before starting. Do not rebuild it from only the validation shard."
+            )
 
 
     # ── Prepare data access ───────────────────────────────────────────────────
@@ -1407,140 +1390,92 @@ def train(cfg: Dict[str, Any]) -> None:
 
 
 
-        # Shard 47 is held out. It stays on disk for the entire run so that it
+        # Explicit shard-level split. Test shards are never downloaded or used
+        # for training/early stopping in this script.
+        all_shards = set(range(total_shards))
+        validation_shards = sorted(set(int(x) for x in ds_cfg.get("validation_shards", [])))
+        test_shards = sorted(set(int(x) for x in ds_cfg.get("test_shards", [])))
+        if not validation_shards:
+            raise ValueError("dataset.validation_shards must contain at least one shard index")
+        if not test_shards:
+            raise ValueError("dataset.test_shards must contain at least one shard index")
+        if set(validation_shards) & set(test_shards):
+            raise ValueError("Validation and test shard lists overlap")
+        if any(x not in all_shards for x in validation_shards + test_shards):
+            raise ValueError(f"Shard indices must be between 0 and {total_shards - 1}")
 
-        # can be reused for validation after every epoch.
+        train_shards = sorted(all_shards - set(validation_shards) - set(test_shards))
+        if not train_shards:
+            raise ValueError("No training shards remain after applying the split")
+        if set(train_shards) & (set(validation_shards) | set(test_shards)):
+            raise RuntimeError("Internal split error: shard leakage detected")
 
-        val_shard_idx = total_shards - 1
+        print(f"\n[Shard Split] Train ({len(train_shards)}): {train_shards}")
+        print(f"[Shard Split] Validation ({len(validation_shards)}): {validation_shards}")
+        print(f"[Shard Split] Held-out test ({len(test_shards)}): {test_shards}")
 
-        print(f"\n[Chunked Mode] Validation shard = {val_shard_idx:02d}")
-
-        download_shard(repo_id, val_shard_idx, val_dir, token=token)
-
-
+        # Keep only validation shard files in this directory; avoid stale files.
+        clear_training_chunk(val_dir)
+        for shard_idx in validation_shards:
+            download_shard(repo_id, shard_idx, val_dir, token=token)
 
         label2id = load_or_create_label_vocab(
-
             labels_path,
-
             val_dir,
-
             processor,
-
             common,
-
         )
-
-
-
-        # IMPORTANT: two validation datasets with the same held-out shard.
-
-        # Loss loader has labels; generation loader has prompt only.
+        validate_chunk_labels(val_dir, label2id, common["disease_col"])
 
         val_loss_ds = SAGEDataset(
-
             parquet_dir=str(val_dir),
-
             processor=processor,
-
             is_training=True,
-
             label2id=label2id,
-
             **common,
-
         )
-
         val_gen_ds = SAGEDataset(
-
             parquet_dir=str(val_dir),
-
             processor=processor,
-
             is_training=False,
-
             label2id=label2id,
-
             **common,
-
         )
-
         val_loss_loader = DataLoader(
-
             val_loss_ds,
-
             batch_size=1,
-
             shuffle=False,
-
             collate_fn=sage_collate_fn,
-
             num_workers=0,
-
             pin_memory=True,
-
         )
-
         val_gen_loader = DataLoader(
-
             val_gen_ds,
-
             batch_size=1,
-
             shuffle=False,
-
             collate_fn=sage_collate_fn,
-
             num_workers=0,
-
             pin_memory=True,
-
         )
-
         print(
-
-            f"[Chunked Mode] {len(label2id)} disease classes | "
-
-            f"validation shard {val_shard_idx:02d} rows={len(val_gen_ds)}"
-
+            f"[Chunked Mode] {len(label2id)} official disease classes | "
+            f"validation shards {validation_shards} rows={len(val_gen_ds)}"
         )
-
-
-
-        train_shards = list(range(val_shard_idx))
 
         chunks = [
-
             train_shards[i:i + chunk_size]
-
             for i in range(0, len(train_shards), chunk_size)
-
         ]
-
-
-
         max_chunks = ds_cfg.get("max_chunks_per_epoch")
-
         if max_chunks is not None:
-
             max_chunks = int(max_chunks)
-
             if max_chunks > 0:
-
                 chunks = chunks[:max_chunks]
-
-
-
         if not chunks:
+            raise RuntimeError("No training chunks configured. Check split and max_chunks_per_epoch.")
 
-            raise RuntimeError("No training chunks configured. Check total_shards/chunk_size/max_chunks_per_epoch.")
-
-
-
-        print(f"[Chunked Mode] Training shards: {train_shards[0]}..{train_shards[-1]} ({len(train_shards)} shards)")
-
+        print(f"[Chunked Mode] Training shards: {len(train_shards)} shards, split-aware")
         print(f"[Chunked Mode] Chunks per epoch: {len(chunks)}")
-
         print(f"[Chunked Mode] Chunk plan: {chunks}")
 
 
@@ -2082,7 +2017,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
                     f"[Disk Cleared] Deleted shards {shard_group}. "
 
-                    f"Only validation shard {val_shard_idx:02d} remains cached.",
+                    f"Validation shards {validation_shards} remain cached; test shards were not touched.",
 
                     flush=True,
 

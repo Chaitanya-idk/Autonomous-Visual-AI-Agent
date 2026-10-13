@@ -1,7 +1,5 @@
-# ============================================================
-# SAGE Crop Disease — LoRA Fine-Tuning Configuration
-# Primary environment: Kaggle GPU + Hugging Face Hub
-# ============================================================
+# SAGE Crop Disease — Fresh split-aware LoRA fine-tuning run
+# IMPORTANT: this starts from the base model; it does NOT resume the old adapter.
 
 model:
   name_or_path: "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2"
@@ -12,44 +10,31 @@ lora:
   r: 32
   lora_alpha: 64
   lora_dropout: 0.05
-  target_modules:
-    - "q_proj"
-    - "k_proj"
-    - "v_proj"
-    - "o_proj"
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
   bias: "none"
   task_type: "CAUSAL_LM"
 
 dataset:
   hf_repo_id: "tirtho149/SAGE"
-
-  # PRIMARY MODE:
-  # Download only chunk_size shards to Kaggle disk, train the SAME model,
-  # delete them, then download the next chunk.
   mode: "chunked"
   chunk_size: 2
   total_shards: 48
-  chunk_dir: "/kaggle/working/data_cache"
+  chunk_dir: "/kaggle/working/data_cache_run2"
 
-  # IMPORTANT:
-  # null/0 = process ALL training chunks in every epoch.
-  # With 48 total shards and shard 47 reserved for validation:
-  #   47 training shards -> 24 chunks at chunk_size=2.
+  # Fixed shard-level split, chosen with seed 42 from shards 0-46.
+  # Validation is used for per-epoch monitoring; test shards are never
+  # downloaded by train.py and must only be evaluated after training ends.
+  validation_shards: [10]
+  test_shards: [21, 23, 24, 29]
   max_chunks_per_epoch: null
-
-
-  # Used only to size the LR scheduler before chunks are downloaded.
-  # The actual batch count is measured from every loaded chunk.
   estimated_rows_per_shard: 15900
 
   streaming: false
   parquet_dir: "/kaggle/working/data"
-
   image_col: "image"
   disease_col: "disease"
   crop_col: "crop"
   label_id_col: ""
-
   train_size: 3200
   val_size: 400
   val_split: 0.15
@@ -60,31 +45,30 @@ preprocessing:
   max_pixels: 25088
 
 evaluation:
-  # Fast per-epoch validation. Final evaluation can use the full shard.
-  val_max_batches: 200
+  # Training-time diagnostic only. The final held-out test is evaluated
+  # separately across all examples in the four test shards.
+  val_max_batches: null
 
 training:
   seed: 42
   batch_size: 16
   gradient_accumulation_steps: 2
   num_workers: 4
-
   learning_rate: 0.0001
   weight_decay: 0.01
   warmup_ratio: 0.05
   num_epochs: 3
   early_stopping_patience: 2
-
   gradient_checkpointing: false
   fp16: true
   bf16: false
   max_grad_norm: 1.0
   save_mode: "adapter"
-  resume: true
-
+  resume: false
+  resume_checkpoint: "latest_checkpoint"
 
 paths:
-  checkpoint_dir: "/kaggle/working/checkpoints"
-  output_dir: "/kaggle/working/outputs"
-  log_dir: "/kaggle/working/logs"
-  labels_json: "/kaggle/working/labels.json"
+  checkpoint_dir: "/kaggle/working/checkpoints_run2"
+  output_dir: "/kaggle/working/outputs_run2"
+  log_dir: "/kaggle/working/logs_run2"
+  labels_json: "/kaggle/working/outputs/labels.json"
