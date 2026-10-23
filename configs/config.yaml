@@ -1,8 +1,10 @@
-# SAGE Crop Disease — Fresh split-aware LoRA fine-tuning run
-# IMPORTANT: this starts from the base model; it does NOT resume the old adapter.
+# ============================================================
+# SAGE Crop Disease — LoRA Fine-Tuning Configuration
+# Primary environment: Kaggle GPU + Hugging Face Hub
+# ============================================================
 
 model:
-  name_or_path: "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2"
+  name_or_path: "/kaggle/input/models/jaccojurg/qwen2-5-vl-3b/transformers/qwen2-5-vl-3b/1"
   local_files_only: true
   torch_dtype: "float16"
 
@@ -10,31 +12,43 @@ lora:
   r: 32
   lora_alpha: 64
   lora_dropout: 0.05
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
   bias: "none"
   task_type: "CAUSAL_LM"
 
 dataset:
   hf_repo_id: "tirtho149/SAGE"
+
+  # PRIMARY MODE:
+  # Download only chunk_size shards to Kaggle disk, train the SAME model,
+  # delete them, then download the next chunk.
   mode: "chunked"
   chunk_size: 2
   total_shards: 48
-  chunk_dir: "/kaggle/working/data_cache_run2"
+  chunk_dir: "/kaggle/working/data_cache"
 
-  # Fixed shard-level split, chosen with seed 42 from shards 0-46.
-  # Validation is used for per-epoch monitoring; test shards are never
-  # downloaded by train.py and must only be evaluated after training ends.
-  validation_shards: [10]
-  test_shards: [21, 23, 24, 29]
+  # Fixed non-overlapping split for 48 shards, chunk_size=2:
+  # Train: shards 0-35 (18 chunks); validation: 36-41 (3 chunks);
+  # final test: 42-47 (3 chunks). Test shards are used only after training.
   max_chunks_per_epoch: null
+
+
+  # Used only to size the LR scheduler before chunks are downloaded.
+  # The actual batch count is measured from every loaded chunk.
   estimated_rows_per_shard: 15900
 
   streaming: false
   parquet_dir: "/kaggle/working/data"
+
   image_col: "image"
   disease_col: "disease"
   crop_col: "crop"
   label_id_col: ""
+
   train_size: 3200
   val_size: 400
   val_split: 0.15
@@ -45,30 +59,33 @@ preprocessing:
   max_pixels: 25088
 
 evaluation:
-  # Training-time diagnostic only. The final held-out test is evaluated
-  # separately across all examples in the four test shards.
+  # Evaluate every example in all 3 validation chunks after each epoch.
+  # null means no batch cap; generation evaluation can take substantial time.
   val_max_batches: null
+  # One-time evaluation across all 3 held-out test chunks after training.
+  test_max_batches: null
 
 training:
   seed: 42
   batch_size: 16
   gradient_accumulation_steps: 2
   num_workers: 4
+
   learning_rate: 0.0001
   weight_decay: 0.01
   warmup_ratio: 0.05
   num_epochs: 3
   early_stopping_patience: 2
+
   gradient_checkpointing: false
   fp16: true
   bf16: false
   max_grad_norm: 1.0
   save_mode: "adapter"
   resume: false
-  resume_checkpoint: "latest_checkpoint"
 
 paths:
-  checkpoint_dir: "/kaggle/working/checkpoints_run2"
-  output_dir: "/kaggle/working/outputs_run2"
-  log_dir: "/kaggle/working/logs_run2"
-  labels_json: "/kaggle/working/outputs/labels.json"
+  checkpoint_dir: "/kaggle/working/checkpoints_run3"
+  output_dir: "/kaggle/working/outputs_run3"
+  log_dir: "/kaggle/working/logs_run3"
+  labels_json: "/kaggle/working/outputs_run3/labels.json"

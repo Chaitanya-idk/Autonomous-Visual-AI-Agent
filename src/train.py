@@ -1407,107 +1407,59 @@ def train(cfg: Dict[str, Any]) -> None:
 
 
 
-        # Shard 47 is held out. It stays on disk for the entire run so that it
+        # Explicit non-overlapping split: 36 train shards, 6 validation shards
+        # (3 two-shard chunks), and 6 final-test shards (3 two-shard chunks).
+        # Validation is used each epoch; test shards are untouched until training ends.
+        if total_shards != 48:
+            raise ValueError(
+                "This configured split expects the 48-shard SAGE dataset. "
+                "Update train_shards/validation_shards/test_shards for a different layout."
+            )
+        train_shards = list(range(0, 36))
+        validation_shards = list(range(36, 42))
+        test_shards = list(range(42, 48))
+        if set(train_shards) & set(validation_shards) or set(train_shards) & set(test_shards) or set(validation_shards) & set(test_shards):
+            raise RuntimeError("Shard split overlap detected")
 
-        # can be reused for validation after every epoch.
+        chunk_dir = Path(ds_cfg.get("chunk_dir", "/kaggle/working/data_cache"))
+        train_dir = chunk_dir / "train"
+        val_dir = chunk_dir / "val"
+        test_dir = chunk_dir / "test"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        val_dir.mkdir(parents=True, exist_ok=True)
+        test_dir.mkdir(parents=True, exist_ok=True)
 
-        val_shard_idx = total_shards - 1
+        print(f"\n[Shard Split] Train shards ({len(train_shards)}): {train_shards}")
+        print(f"[Shard Split] Validation shards ({len(validation_shards)}; 3 chunks): {validation_shards}")
+        print(f"[Shard Split] Final test shards ({len(test_shards)}; 3 chunks): {test_shards}")
 
-        print(f"\n[Chunked Mode] Validation shard = {val_shard_idx:02d}")
+        # Start with a clean validation directory so stale Parquet files cannot leak in.
+        clear_training_chunk(val_dir)
+        for shard_idx in validation_shards:
+            download_shard(repo_id, shard_idx, val_dir, token=token)
 
-        download_shard(repo_id, val_shard_idx, val_dir, token=token)
-
-
-
-        label2id = load_or_create_label_vocab(
-
-            labels_path,
-
-            val_dir,
-
-            processor,
-
-            common,
-
-        )
-
-
-
-        # IMPORTANT: two validation datasets with the same held-out shard.
-
-        # Loss loader has labels; generation loader has prompt only.
+        label2id = load_or_create_label_vocab(labels_path, val_dir, processor, common)
 
         val_loss_ds = SAGEDataset(
-
-            parquet_dir=str(val_dir),
-
-            processor=processor,
-
-            is_training=True,
-
-            label2id=label2id,
-
-            **common,
-
+            parquet_dir=str(val_dir), processor=processor, is_training=True,
+            label2id=label2id, **common,
         )
-
         val_gen_ds = SAGEDataset(
-
-            parquet_dir=str(val_dir),
-
-            processor=processor,
-
-            is_training=False,
-
-            label2id=label2id,
-
-            **common,
-
+            parquet_dir=str(val_dir), processor=processor, is_training=False,
+            label2id=label2id, **common,
         )
-
         val_loss_loader = DataLoader(
-
-            val_loss_ds,
-
-            batch_size=1,
-
-            shuffle=False,
-
-            collate_fn=sage_collate_fn,
-
-            num_workers=0,
-
-            pin_memory=True,
-
+            val_loss_ds, batch_size=1, shuffle=False, collate_fn=sage_collate_fn,
+            num_workers=0, pin_memory=True,
         )
-
         val_gen_loader = DataLoader(
-
-            val_gen_ds,
-
-            batch_size=1,
-
-            shuffle=False,
-
-            collate_fn=sage_collate_fn,
-
-            num_workers=0,
-
-            pin_memory=True,
-
+            val_gen_ds, batch_size=1, shuffle=False, collate_fn=sage_collate_fn,
+            num_workers=0, pin_memory=True,
         )
-
         print(
-
             f"[Chunked Mode] {len(label2id)} disease classes | "
-
-            f"validation shard {val_shard_idx:02d} rows={len(val_gen_ds)}"
-
+            f"validation shards {validation_shards} rows={len(val_gen_ds)}"
         )
-
-
-
-        train_shards = list(range(val_shard_idx))
 
         chunks = [
 
@@ -1537,7 +1489,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
 
 
-        print(f"[Chunked Mode] Training shards: {train_shards[0]}..{train_shards[-1]} ({len(train_shards)} shards)")
+        print(f"[Chunked Mode] Training shards: {len(train_shards)} split-safe shards")
 
         print(f"[Chunked Mode] Chunks per epoch: {len(chunks)}")
 
@@ -2082,7 +2034,7 @@ def train(cfg: Dict[str, Any]) -> None:
 
                     f"[Disk Cleared] Deleted shards {shard_group}. "
 
-                    f"Only validation shard {val_shard_idx:02d} remains cached.",
+                    f"Validation shards {validation_shards} remain cached; held-out test shards untouched.",
 
                     flush=True,
 
@@ -2450,6 +2402,55 @@ def train(cfg: Dict[str, Any]) -> None:
 
 
 
+    # ── One-time final evaluation on the untouched held-out test split ───────
+    final_test_metrics = None
+    if is_chunked:
+        best_ckpt_dir = ckpt_dir / "best_checkpoint"
+        if best_ckpt_dir.exists() and (best_ckpt_dir / "trainer_state.json").exists():
+            print(f"\n[Final Test] Restoring best validation checkpoint from {best_ckpt_dir}", flush=True)
+            load_checkpoint_state(model, optimizer, scheduler, best_ckpt_dir)
+        else:
+            raise FileNotFoundError(
+                f"Best checkpoint not found at {best_ckpt_dir}; refusing to report final test metrics."
+            )
+        print("[Final Test] Downloading held-out test shards only after training is complete.", flush=True)
+        clear_training_chunk(test_dir)
+        for shard_idx in test_shards:
+            download_shard(repo_id, shard_idx, test_dir, token=token)
+        validate_chunk_labels(test_dir, label2id, common["disease_col"])
+
+        test_loss_ds = SAGEDataset(
+            parquet_dir=str(test_dir), processor=processor, is_training=True,
+            label2id=label2id, **common,
+        )
+        test_gen_ds = SAGEDataset(
+            parquet_dir=str(test_dir), processor=processor, is_training=False,
+            label2id=label2id, **common,
+        )
+        test_loss_loader = DataLoader(
+            test_loss_ds, batch_size=1, shuffle=False, collate_fn=sage_collate_fn,
+            num_workers=0, pin_memory=True,
+        )
+        test_gen_loader = DataLoader(
+            test_gen_ds, batch_size=1, shuffle=False, collate_fn=sage_collate_fn,
+            num_workers=0, pin_memory=True,
+        )
+        test_max_batches = cfg.get("evaluation", {}).get("test_max_batches", None)
+        final_test_metrics = validate(
+            model, processor, test_loss_loader, test_gen_loader, label2id,
+            device, dtype, max_batches=test_max_batches, epoch="FINAL TEST",
+        )
+        with open(log_dir / "final_test_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(final_test_metrics, f, indent=2, ensure_ascii=False)
+        with open(log_dir / "final_test_debug.json", "w", encoding="utf-8") as f:
+            json.dump(final_test_metrics.get("validation_debug_samples", []), f, indent=2, ensure_ascii=False)
+        print(
+            f"[FINAL TEST] shards={test_shards} | samples={final_test_metrics['num_eval_samples']} | "
+            f"accuracy={final_test_metrics['accuracy']:.4f} | "
+            f"macro_f1={final_test_metrics['macro_f1']:.4f} | "
+            f"unknown={final_test_metrics['unknown_rate']:.2%}", flush=True,
+        )
+
     summary = {
 
         "best_epoch": best_epoch,
@@ -2462,11 +2463,11 @@ def train(cfg: Dict[str, Any]) -> None:
 
         "num_epochs_requested": num_epochs,
 
-        "training_shards": list(range(ds_cfg.get("total_shards", 48) - 1)) if is_chunked else None,
-
-        "validation_shard": ds_cfg.get("total_shards", 48) - 1 if is_chunked else None,
-
+        "training_shards": train_shards if is_chunked else None,
+        "validation_shards": validation_shards if is_chunked else None,
+        "test_shards": test_shards if is_chunked else None,
         "chunks_per_epoch": len(chunks) if is_chunked else None,
+        "final_test_metrics": final_test_metrics,
 
     }
 
